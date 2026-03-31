@@ -10,12 +10,13 @@
 #   1. Detect kernel version from source tree (e.g., 6.1.1)
 #   2. Scan NVD JSON feeds for ALL CVEs affecting that kernel version (CPE match)
 #   3. Filter out CVEs not applicable to the kernel .config
-#   4. Check git repo for backported fixes (CVE-ID in commit messages)
+#   4. Check git repos (upstream + stable/vendor) for backported fixes
 #   5. Output CSV: each CVE marked as FIXED or UNFIXED
 #
 # Usage:
-#   ./kernel-backport-checker.sh -s <kernel-source-dir> -d <linux-git-dir> \
-#       -e <kev-data> -f <nvd-json-data-feeds> -k <kernel-config> -o <output-dir>
+#   ./kernel-backport-checker.sh -s <kernel-source-dir> -d <upstream-linux-git-dir> \
+#       -e <kev-data> -f <nvd-json-data-feeds> -k <kernel-config> -o <output-dir> \
+#       [-b <stable-vendor-git-dir>]
 #
 
 set -euo pipefail
@@ -26,6 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ---- Global variables ----
 KEV_FILE=""
 KERNEL_DIR=""
+STABLE_DIR=""         # Optional: stable/vendor git repo with backport commits
 KERNEL_CONFIG=""
 KERNEL_SRC=""
 NVD_FEEDS_DIR=""
@@ -62,19 +64,24 @@ Usage:
 Required Options:
     -s <path>    Kernel source directory (must contain Makefile)
                  Provides: kernel version, Makefiles for CONFIG mapping
-    -d <path>    Linux kernel git directory (with backport commits)
+    -d <path>    Upstream Linux kernel git directory (e.g., torvalds/linux.git clone)
+                 Used for: fix commit hash lookup, diff extraction
     -e <path>    CISA KEV data directory or JSON file
     -f <path>    NVD JSON data feeds directory (fkie-cad/nvd-json-data-feeds)
     -k <path>    Kernel .config file
     -o <path>    Output directory for results
 
 Optional:
+    -b <path>    Stable/vendor git repository with backport commits
+                 Used for: CVE-mentioning commit search, backport diff extraction
+                 If omitted, only the upstream repo (-d) is searched for backports
     -j <N>       Number of parallel jobs (default: nproc/2, min 1)
     -h           Show this help
 
 Example:
     $0 -s linux-6.1.1 -d linux -e kev-data -f nvd-json-data-feeds -k 6.1-config -o output
-    $0 -s linux-6.1.1 -d linux -e kev-data -f nvd-json-data-feeds -k 6.1-config -o output -j 8
+    $0 -s linux-6.1.1 -d linux -b linux-stable -e kev-data -f nvd-json-data-feeds -k 6.1-config -o output
+    $0 -s linux-6.1.1 -d linux -b linux-stable -e kev-data -f nvd-json-data-feeds -k 6.1-config -o output -j 8
 
 Output:
     <output-dir>/backport-report.csv
@@ -118,10 +125,11 @@ check_dependencies() {
 # =============================================================================
 
 parse_args() {
-    while getopts "e:d:k:f:o:s:j:h" opt; do
+    while getopts "e:d:b:k:f:o:s:j:h" opt; do
         case $opt in
             e) KEV_FILE="$OPTARG" ;;
             d) KERNEL_DIR="$OPTARG" ;;
+            b) STABLE_DIR="$OPTARG" ;;
             k) KERNEL_CONFIG="$OPTARG" ;;
             s) KERNEL_SRC="$OPTARG" ;;
             f) NVD_FEEDS_DIR="$OPTARG" ;;
@@ -158,6 +166,7 @@ parse_args() {
     # Validate inputs
     if [[ ! -f "$KEV_FILE" ]]; then log_error "KEV file not found: $KEV_FILE"; exit 1; fi
     if [[ ! -d "$KERNEL_DIR/.git" ]]; then log_error "Not a git repository: $KERNEL_DIR"; exit 1; fi
+    if [[ -n "$STABLE_DIR" && ! -d "$STABLE_DIR/.git" ]]; then log_error "Not a git repository: $STABLE_DIR"; exit 1; fi
     if [[ ! -d "$NVD_FEEDS_DIR" ]]; then log_error "NVD feeds directory not found: $NVD_FEEDS_DIR"; exit 1; fi
 
     # Validate kernel source directory
@@ -432,7 +441,16 @@ extract_nvd_fix_refs() {
 build_git_hash_index() {
     log_info "Building git hash index..."
 
-    git -C "$KERNEL_DIR" rev-list --all 2>/dev/null | cut -c1-12 | sort > "$GIT_HASH_INDEX"
+    # Include hashes from upstream repo
+    git -C "$KERNEL_DIR" rev-list --all 2>/dev/null | cut -c1-12 > "$GIT_HASH_INDEX.tmp"
+
+    # Also include hashes from stable/vendor repo if provided
+    if [[ -n "$STABLE_DIR" ]]; then
+        git -C "$STABLE_DIR" rev-list --all 2>/dev/null | cut -c1-12 >> "$GIT_HASH_INDEX.tmp"
+    fi
+
+    sort -u "$GIT_HASH_INDEX.tmp" > "$GIT_HASH_INDEX"
+    rm -f "$GIT_HASH_INDEX.tmp"
 
     local count
     count=$(wc -l < "$GIT_HASH_INDEX")
@@ -477,13 +495,20 @@ build_config_mapping() {
 
     # Generate mapping by scanning all Makefile/Kbuild files
     # Uses awk for fast bulk extraction with line-continuation handling
+    # MUST use -P1 (sequential) to prevent output line interleaving
+    # when multiple awk processes write simultaneously
+    local srcroot="$KERNEL_SRC"
+    # Ensure exactly one trailing slash for consistent path stripping
+    srcroot="${srcroot%/}/"
     find "$KERNEL_SRC" \( -name "Makefile" -o -name "Kbuild" \) -print0 | \
-      xargs -0 -P"$JOBS" -n50 awk -v srcroot="$KERNEL_SRC/" '
+      xargs -0 -P1 -n50 awk -v srcroot="$srcroot" '
         FILENAME != prev_file {
             prev_file = FILENAME
             dir = FILENAME
             sub(/\/[^\/]+$/, "", dir)   # remove filename
-            sub(srcroot, "", dir)        # make relative
+            sub(srcroot, "", dir)        # make relative (with trailing slash)
+            # Handle root-level Makefile where dir == srcroot without trailing slash
+            if (dir == substr(srcroot, 1, length(srcroot)-1)) dir = ""
             buf = ""
         }
         /\\$/ { buf = buf $0; next }
@@ -496,11 +521,13 @@ build_config_mapping() {
                 if (parts[i] ~ /\.o$/) {
                     base = parts[i]
                     sub(/\.o$/, ".c", base)
-                    print dir "/" base "\t" config
+                    if (dir == "") print base "\t" config
+                    else print dir "/" base "\t" config
                 } else if (parts[i] ~ /\/$/) {
                     subdir = parts[i]
                     sub(/\/$/, "", subdir)
-                    print dir "/" subdir "\t" config
+                    if (dir == "") print subdir "\t" config
+                    else print dir "/" subdir "\t" config
                 }
             }
         }
@@ -510,7 +537,8 @@ build_config_mapping() {
                 if (parts[i] ~ /\.o$/) {
                     base = parts[i]
                     sub(/\.o$/, ".c", base)
-                    print dir "/" base "\tALWAYS_BUILT"
+                    if (dir == "") print base "\tALWAYS_BUILT"
+                    else print dir "/" base "\tALWAYS_BUILT"
                 }
             }
         }
@@ -544,11 +572,21 @@ extract_backported_cves() {
 
     local record_sep="---COMMIT_RECORD---"
 
+    # Search upstream repo for CVE mentions
     git -C "$KERNEL_DIR" log --all --grep="CVE-" \
         --pretty=format:"${record_sep}%H|%ci|%an|%s%n%b" > "$BACKPORTED_CVES_FILE.raw" 2>/dev/null || {
         log_error "Failed to read git log from $KERNEL_DIR"
         exit 1
     }
+
+    # Also search stable/vendor repo if provided
+    if [[ -n "$STABLE_DIR" ]]; then
+        log_info "Searching stable/vendor repo for CVE mentions: $STABLE_DIR"
+        git -C "$STABLE_DIR" log --all --grep="CVE-" \
+            --pretty=format:"${record_sep}%H|%ci|%an|%s%n%b" >> "$BACKPORTED_CVES_FILE.raw" 2>/dev/null || {
+            log_warn "Failed to read git log from $STABLE_DIR (continuing with upstream only)"
+        }
+    fi
 
     # Use awk to extract CVE-ID|hash|date|author|subject per CVE per commit
     awk -v RS="---COMMIT_RECORD---" '
@@ -650,8 +688,8 @@ process_results() {
         fi
     done < "$NVD_FIX_REFS_FILE"
 
-    # ---- Step 2: Find which upstream fix hashes exist in upstream repo ----
-    log_info "  Matching fix commits against upstream repo..."
+    # ---- Step 2: Find which upstream fix hashes exist in any repo ----
+    log_info "  Matching fix commits against git repos..."
 
     local fix_hashes_sorted="$OUTPUT_DIR/.fix_hashes_sorted.txt"
     awk -F'\t' '{print substr($2,1,12) "\t" $1 "\t" $2}' "$NVD_FIX_REFS_FILE" | \
@@ -663,7 +701,7 @@ process_results() {
     done < <(join -t$'\t' -1 1 -2 1 "$fix_hashes_sorted" "$GIT_HASH_INDEX" 2>/dev/null)
 
     local matched_hashes=${#HASH_IN_REPO[@]}
-    log_info "  Found $matched_hashes fix commits in upstream repo"
+    log_info "  Found $matched_hashes fix commits in git repos"
     rm -f "$fix_hashes_sorted"
 
     # ---- Step 3: Extract changed files + full diffs from all fix commits ----
@@ -682,7 +720,9 @@ process_results() {
     } | sort -u > "$all_hashes_file"
 
     local kernel_dir="$KERNEL_DIR"
+    local stable_dir="${STABLE_DIR:-}"
     # Parallel extraction of changed files AND full diffs
+    # Try upstream repo first, fall back to stable repo if hash not found
     cat "$all_hashes_file" | xargs -P"$JOBS" -I{} bash -c '
         full_hash="{}"
         short="${full_hash:0:12}"
@@ -691,10 +731,20 @@ process_results() {
         if [[ ! -f "$files_out" ]]; then
             git -C "'"$kernel_dir"'" diff-tree --no-commit-id -r --name-only "$short" \
                 > "$files_out" 2>/dev/null || true
+            # If upstream repo did not have this commit, try stable repo
+            if [[ ! -s "$files_out" && -n "'"$stable_dir"'" ]]; then
+                git -C "'"$stable_dir"'" diff-tree --no-commit-id -r --name-only "$short" \
+                    > "$files_out" 2>/dev/null || true
+            fi
         fi
         if [[ ! -f "$diff_out" ]]; then
             git -C "'"$kernel_dir"'" diff "${short}^..${short}" \
                 > "$diff_out" 2>/dev/null || true
+            # If upstream repo did not have this commit, try stable repo
+            if [[ ! -s "$diff_out" && -n "'"$stable_dir"'" ]]; then
+                git -C "'"$stable_dir"'" diff "${short}^..${short}" \
+                    > "$diff_out" 2>/dev/null || true
+            fi
         fi
     ' || true
 
@@ -754,9 +804,11 @@ process_results() {
     }
 
     # ---- Step 7: Helper - check if a fix commit is applied in target kernel ----
-    # Strategy: extract distinctive "added lines" from the fix commit diff,
-    # check each fingerprint against its specific changed file in the target.
-    # Uses per-file matching (not global) to avoid overcounting across files.
+    # Strategy: extract distinctive "added lines" AND "removed lines" from the
+    # fix commit diff. Added lines = fix code, removed lines = vulnerable code.
+    # Accumulate match evidence across ALL changed files, then decide verdict.
+    #
+    # Returns verdict via echo: FIXED, UNFIXED, LIKELY_FIXED, INCONCLUSIVE
     check_fix_applied() {
         local commit_hash="$1"
         local short="${commit_hash:0:12}"
@@ -764,84 +816,343 @@ process_results() {
         # Get changed files
         local files_file="$commit_files_dir/$commit_hash"
         if [[ ! -s "$files_file" ]]; then
-            return 1
+            echo "INCONCLUSIVE"
+            return
         fi
 
         # Use pre-computed diff (avoids git call in hot path)
         local diff_file="$commit_diffs_dir/$commit_hash"
         if [[ ! -s "$diff_file" ]]; then
-            return 1
+            echo "INCONCLUSIVE"
+            return
         fi
 
-        # Process each changed file independently
-        local any_file_verified=0
+        # Awk filter for extracting distinctive lines (shared between added/removed)
+        local awk_filter='
+            length(line) < 8 { next }
+            line == "{" || line == "}" { next }
+            substr(line,1,2) == "/*" || substr(line,1,1) == "*" { next }
+            substr(line,1,8) == "#include" { next }
+            line == "break;" || line == "continue;" { next }
+            substr(line,1,6) == "return" { next }
+            line == "else" || line == "default:" { next }
+            line == "NULL" { next }
+            { print line }
+        '
+
+        # Accumulate match evidence across ALL changed files
+        local total_added=0 total_removed=0
+        local added_matched=0 removed_matched=0
         local any_file_checked=0
+        local removed_contiguous=0
+        # Store all removed lines for contiguous check later
+        local all_removed_lines=""
+        local contiguous_checked=0
 
         while IFS= read -r target_file; do
             [[ -z "$target_file" ]] && continue
-            # Only check source files (.c, .h, .S)
             [[ "$target_file" =~ \.(c|h|S)$ ]] || continue
 
             local full_path="$KERNEL_SRC/$target_file"
             [[ -f "$full_path" ]] || continue
 
-            # Extract fingerprints only for lines added in this specific file
-            local fingerprints
-            fingerprints=$(awk -v fname="$target_file" '
+            # Extract added lines (fix code) for this file
+            local added_lines
+            added_lines=$(awk -v fname="$target_file" '
                     /^diff --git/ { in_file = index($0, fname) > 0 }
                     substr($0,1,3) == "+++" { next }
                     in_file && substr($0,1,1) == "+" {
                         line = substr($0, 2)
-                        # Strip leading/trailing whitespace
                         gsub(/^[[:space:]]+/, "", line)
                         gsub(/[[:space:]]+$/, "", line)
-                        if (length(line) < 15) next
-                        if (line == "{" || line == "}") next
-                        if (substr(line,1,2) == "/*") next
-                        if (substr(line,1,1) == "*") next
-                        if (substr(line,1,8) == "#include") next
-                        if (line == "break;") next
-                        if (substr(line,1,6) == "return") next
-                        if (substr(line,1,8) == "rcu_read") next
-                        if (substr(line,1,9) == "spin_lock" || substr(line,1,11) == "spin_unlock") next
-                        if (substr(line,1,10) == "mutex_lock" || substr(line,1,12) == "mutex_unlock") next
-                        if (line == "NULL") next
-                        print line
+                        '"$awk_filter"'
                     }
-                ' "$diff_file" | head -5)
+                ' "$diff_file" | sort -u | head -10)
 
-            [[ -z "$fingerprints" ]] && continue
+            # Extract removed lines (vulnerable code) for this file
+            local removed_lines
+            removed_lines=$(awk -v fname="$target_file" '
+                    /^diff --git/ { in_file = index($0, fname) > 0 }
+                    substr($0,1,3) == "---" { next }
+                    in_file && substr($0,1,1) == "-" {
+                        line = substr($0, 2)
+                        gsub(/^[[:space:]]+/, "", line)
+                        gsub(/[[:space:]]+$/, "", line)
+                        '"$awk_filter"'
+                    }
+                ' "$diff_file" | sort -u | head -10)
 
+            local file_added=0 file_removed=0
+            [[ -n "$added_lines" ]] && file_added=$(echo "$added_lines" | wc -l)
+            [[ -n "$removed_lines" ]] && file_removed=$(echo "$removed_lines" | wc -l)
+
+            [[ "$file_added" -eq 0 && "$file_removed" -eq 0 ]] && continue
             ((any_file_checked++)) || true
+            total_added=$((total_added + file_added))
+            total_removed=$((total_removed + file_removed))
 
-            # Count how many distinct fingerprints match in this file
-            local total_fps matched_fps
-            total_fps=$(echo "$fingerprints" | wc -l)
-            matched_fps=0
-            declare -A seen_fps=()
+            # Count added line matches
+            if [[ "$file_added" -gt 0 ]]; then
+                declare -A seen_added=()
+                while IFS= read -r fp; do
+                    [[ -z "$fp" || -n "${seen_added[$fp]+_}" ]] && continue
+                    seen_added["$fp"]=1
+                    grep -qF -- "$fp" "$full_path" 2>/dev/null && ((added_matched++)) || true
+                done <<< "$added_lines"
+                unset seen_added
+            fi
 
-            while IFS= read -r fp; do
-                [[ -z "$fp" ]] && continue
-                # Skip if already counted this fingerprint (dedup)
-                [[ -n "${seen_fps[$fp]+_}" ]] && continue
-                seen_fps["$fp"]=1
-                if grep -qF "$fp" "$full_path" 2>/dev/null; then
-                    ((matched_fps++)) || true
+            # Count removed line matches
+            # For short removed lines (<30 chars), use whole-line matching to
+            # avoid substring false positives (e.g., "sb->s_flags" matching
+            # inside "sbi->sb->s_flags")
+            if [[ "$file_removed" -gt 0 ]]; then
+                declare -A seen_removed=()
+                while IFS= read -r fp; do
+                    [[ -z "$fp" || -n "${seen_removed[$fp]+_}" ]] && continue
+                    seen_removed["$fp"]=1
+                    if [[ "${#fp}" -lt 30 ]]; then
+                        # Whole-line match: trim leading/trailing whitespace from
+                        # each source line before comparing
+                        awk -v pat="$fp" '{
+                            line = $0; gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
+                            if (line == pat) { found=1; exit }
+                        } END { exit !found }' "$full_path" 2>/dev/null && ((removed_matched++)) || true
+                    else
+                        grep -qF -- "$fp" "$full_path" 2>/dev/null && ((removed_matched++)) || true
+                    fi
+                done <<< "$removed_lines"
+                unset seen_removed
+
+                # Contiguous block check for this file's removed lines
+                if [[ "$contiguous_checked" -eq 0 && "$file_removed" -ge 1 ]]; then
+                    local r_ratio_file=0
+                    # Only check contiguous if this file has high removed match
+                    local file_r_matched=0
+                    while IFS= read -r fp; do
+                        [[ -z "$fp" ]] && continue
+                        if [[ "${#fp}" -lt 30 ]]; then
+                            awk -v pat="$fp" '{
+                                line = $0; gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
+                                if (line == pat) { found=1; exit }
+                            } END { exit !found }' "$full_path" 2>/dev/null && ((file_r_matched++)) || true
+                        else
+                            grep -qF -- "$fp" "$full_path" 2>/dev/null && ((file_r_matched++)) || true
+                        fi
+                    done <<< "$removed_lines"
+                    [[ "$file_removed" -gt 0 ]] && r_ratio_file=$(( file_r_matched * 100 / file_removed ))
+
+                    if [[ "$r_ratio_file" -ge 70 ]]; then
+                        contiguous_checked=1
+                        if [[ "$file_removed" -ge 2 ]]; then
+                            local line1 line2
+                            line1=$(echo "$removed_lines" | head -1)
+                            line2=$(echo "$removed_lines" | sed -n '2p')
+                            if [[ -n "$line1" && -n "$line2" ]]; then
+                                local ln_nums
+                                ln_nums=$(grep -nF -- "$line1" "$full_path" 2>/dev/null | cut -d: -f1 || true)
+                                for ln in $ln_nums; do
+                                    local start=$(( ln > 1 ? ln - 1 : 1 ))
+                                    local end=$(( ln + 5 ))
+                                    if sed -n "${start},${end}p" "$full_path" 2>/dev/null | grep -qF -- "$line2"; then
+                                        removed_contiguous=1
+                                        break
+                                    fi
+                                done
+                            fi
+                        elif [[ "$file_removed" -eq 1 ]]; then
+                            removed_contiguous=1
+                        fi
+                    fi
                 fi
-            done <<< "$fingerprints"
-
-            # Require majority of DISTINCT fingerprints to match
-            local threshold=$(( (total_fps + 1) / 2 ))
-            if [[ "$matched_fps" -ge "$threshold" && "$total_fps" -gt 0 ]]; then
-                any_file_verified=1
-                break
             fi
 
         done < "$files_file"
 
-        # Fix is applied if at least one changed file has matching fingerprints
-        [[ "$any_file_verified" -eq 1 ]] && return 0
-        return 1
+        # No files checked -> INCONCLUSIVE
+        [[ "$any_file_checked" -eq 0 ]] && { echo "INCONCLUSIVE"; return; }
+
+        # Calculate aggregate ratios
+        local added_ratio=0 removed_ratio=0
+        [[ "$total_added" -gt 0 ]] && added_ratio=$(( (added_matched * 100) / total_added ))
+        [[ "$total_removed" -gt 0 ]] && removed_ratio=$(( (removed_matched * 100) / total_removed ))
+        [[ "$added_ratio" -gt 100 ]] && added_ratio=100
+        [[ "$removed_ratio" -gt 100 ]] && removed_ratio=100
+
+        # ---- Phase 1: Fingerprint-based verdict ----
+        local verdict="INCONCLUSIVE"
+
+        if [[ "$total_removed" -gt 0 && "$removed_ratio" -ge 70 && "$removed_contiguous" -eq 1 ]]; then
+            verdict="UNFIXED"
+        elif [[ "$total_added" -gt 0 && "$added_ratio" -ge 50 ]]; then
+            if [[ "$total_removed" -ge 2 && "$total_added" -ge 3 && "$removed_ratio" -lt 30 ]]; then
+                # Fix code strongly present (≥3 added lines match) + most
+                # vulnerable code gone (≥2 removed, <30% match) -> FIXED
+                verdict="FIXED"
+            elif [[ "$total_removed" -gt 0 && "$removed_ratio" -lt 50 ]]; then
+                # Fix code present but removed signal weak (1 line or 30-50%):
+                # ambiguous, could be partial fix or coincidental matches
+                verdict="LIKELY_FIXED"
+            elif [[ "$total_removed" -eq 0 ]]; then
+                # Pure-addition fix: no removed lines to confirm vulnerability was
+                # present. Added lines may coincidentally match existing code in
+                # other functions.
+                verdict="LIKELY_FIXED"
+            elif [[ "$removed_ratio" -ge 70 ]]; then
+                # Removed code >=70% present (contiguous or scattered) means
+                # vulnerable code is still in the source. Added matches are
+                # likely coincidental from other functions.
+                verdict="UNFIXED"
+            else
+                # Remaining cases (50%<=removed<70%):
+                # ambiguous signal, needs review
+                verdict="LIKELY_FIXED"
+            fi
+        elif [[ "$total_added" -gt 0 && "$added_ratio" -ge 30 ]]; then
+            if [[ "$total_removed" -gt 0 && "$removed_ratio" -ge 50 ]]; then
+                # Partial fix match + vulnerable code substantially present -> UNFIXED
+                verdict="UNFIXED"
+            else
+                verdict="LIKELY_FIXED"
+            fi
+        elif [[ "$total_added" -eq 0 && "$total_removed" -gt 0 && "$removed_matched" -eq 0 ]]; then
+            # Removal-only fix: no added fingerprint lines (e.g., comment-only
+            # additions filtered out) but all removed (vulnerable) lines are
+            # gone from the source. Strong signal the fix was applied.
+            if [[ "$total_removed" -ge 2 ]]; then
+                verdict="FIXED"
+            else
+                verdict="LIKELY_FIXED"
+            fi
+        elif [[ "$total_removed" -gt 0 && "$removed_ratio" -ge 50 ]]; then
+            if [[ "$removed_contiguous" -eq 1 ]]; then
+                verdict="UNFIXED"
+            else
+                verdict="UNFIXED"
+            fi
+        elif [[ "$total_added" -gt 0 && "$total_added" -le 2 && "$added_matched" -gt 0 ]]; then
+            verdict="LIKELY_FIXED"
+        elif [[ "$total_added" -ge 3 && "$added_matched" -eq 0 ]]; then
+            verdict="UNFIXED"
+        fi
+
+        # ---- Phase 2: Context-aware confirmation ----
+        # Use context adjacency to upgrade/downgrade verdicts.
+        # Only runs for LIKELY_FIXED and INCONCLUSIVE. Context adjacency is
+        # unreliable for overriding UNFIXED verdicts (83% false positive rate
+        # in testing) because context lines and fix lines repeat across
+        # functions in large kernel source files.
+        if [[ "$verdict" == "LIKELY_FIXED" || "$verdict" == "INCONCLUSIVE" ]]; then
+            local ctx_found=0 ctx_fixed=0 ctx_unfixed=0
+
+            while IFS= read -r target_file; do
+                [[ -z "$target_file" || ! "$target_file" =~ \.(c|h|S)$ ]] && continue
+                local full_path="$KERNEL_SRC/$target_file"
+                [[ -f "$full_path" ]] || continue
+
+                # Check context+ADDED pairs: was the fix inserted near its context?
+                # Extracts both context_before+added AND context_after+added pairs
+                while IFS=$'\t' read -r ctx_line add_line; do
+                    [[ -z "$ctx_line" || -z "$add_line" ]] && continue
+                    ((ctx_found++)) || true
+                    local ctx_lns
+                    ctx_lns=$(grep -nF -- "$ctx_line" "$full_path" 2>/dev/null | cut -d: -f1 || true)
+                    [[ -z "$ctx_lns" ]] && continue
+                    local found_near=0
+                    for cln in $ctx_lns; do
+                        local cs=$((cln > 3 ? cln - 3 : 1)) ce=$((cln + 3))
+                        if sed -n "${cs},${ce}p" "$full_path" 2>/dev/null | grep -qF -- "$add_line"; then
+                            found_near=1; break
+                        fi
+                    done
+                    if [[ "$found_near" -eq 1 ]]; then
+                        ((ctx_fixed++)) || true
+                    else
+                        ((ctx_unfixed++)) || true
+                    fi
+                done < <(awk -v fname="$target_file" '
+                    /^diff --git/ { in_file = index($0, fname) > 0 }
+                    in_file && substr($0,1,1) == " " {
+                        ctx = $0; sub(/^[ \t]+/, "", ctx); sub(/[ \t]+$/, "", ctx)
+                        # context_after: pair previous added line with this context
+                        if (last_add != "" && length(ctx) >= 8 && ctx !~ /^[\/\*]/) {
+                            printf "%s\t%s\n", ctx, last_add
+                        }
+                        last_add = ""
+                    }
+                    in_file && substr($0,1,1) == "+" && substr($0,1,3) != "+++" {
+                        add = substr($0, 2); sub(/^[ \t]+/, "", add); sub(/[ \t]+$/, "", add)
+                        # context_before: pair previous context with this added line
+                        if (length(ctx) >= 8 && length(add) >= 4 && ctx !~ /^[\/\*]/ && add != "{" && add != "}") {
+                            printf "%s\t%s\n", ctx, add
+                            ctx = ""
+                        }
+                        if (length(add) >= 4 && add != "{" && add != "}") last_add = add
+                    }
+                ' "$diff_file")
+
+                # Check context+REMOVED pairs: is vulnerable code still near its context?
+                while IFS=$'\t' read -r ctx_line rm_line; do
+                    [[ -z "$ctx_line" || -z "$rm_line" ]] && continue
+                    ((ctx_found++)) || true
+                    local ctx_lns
+                    ctx_lns=$(grep -nF -- "$ctx_line" "$full_path" 2>/dev/null | cut -d: -f1 || true)
+                    [[ -z "$ctx_lns" ]] && continue
+                    local found_near=0
+                    for cln in $ctx_lns; do
+                        local cs=$cln ce=$((cln + 3))
+                        if sed -n "${cs},${ce}p" "$full_path" 2>/dev/null | grep -qF -- "$rm_line"; then
+                            found_near=1; break
+                        fi
+                    done
+                    if [[ "$found_near" -eq 1 ]]; then
+                        # Vulnerable code still present near context -> unfixed signal
+                        ((ctx_unfixed++)) || true
+                    else
+                        # Vulnerable code gone from context -> fixed signal
+                        ((ctx_fixed++)) || true
+                    fi
+                done < <(awk -v fname="$target_file" '
+                    /^diff --git/ { in_file = index($0, fname) > 0 }
+                    in_file && substr($0,1,1) == " " {
+                        ctx = $0; sub(/^[ \t]+/, "", ctx); sub(/[ \t]+$/, "", ctx)
+                    }
+                    in_file && substr($0,1,1) == "-" && substr($0,1,3) != "---" {
+                        rm = substr($0, 2); sub(/^[ \t]+/, "", rm); sub(/[ \t]+$/, "", rm)
+                        if (length(ctx) >= 8 && length(rm) >= 4 && ctx !~ /^[\/\*]/ && rm != "{" && rm != "}") {
+                            printf "%s\t%s\n", ctx, rm
+                            ctx = ""
+                        }
+                    }
+                ' "$diff_file")
+            done < "$files_file"
+
+            if [[ "$ctx_found" -gt 0 ]]; then
+                if [[ "$ctx_fixed" -gt "$ctx_unfixed" ]]; then
+                    # Context majority says fix applied
+                    if [[ "$verdict" == "INCONCLUSIVE" ]]; then
+                        verdict="LIKELY_FIXED"
+                    fi
+                    # LIKELY_FIXED stays LIKELY_FIXED - context adjacency alone
+                    # is not reliable enough to upgrade to FIXED. Only Phase 1
+                    # with strong removed-line evidence can produce FIXED.
+                elif [[ "$ctx_unfixed" -gt "$ctx_fixed" ]]; then
+                    # Context majority says fix NOT applied
+                    if [[ "$verdict" == "LIKELY_FIXED" ]]; then
+                        if [[ "$ctx_unfixed" -ge $(( ctx_fixed * 2 + 1 )) && "$total_added" -le 2 ]]; then
+                            # Strong unfixed signal + weak added match -> UNFIXED
+                            verdict="UNFIXED"
+                        fi
+                    elif [[ "$verdict" == "INCONCLUSIVE" ]]; then
+                        verdict="UNFIXED"
+                    fi
+                    # UNFIXED stays UNFIXED (confirmed by context)
+                fi
+                # Equal context signals -> don't change verdict
+            fi
+        fi
+
+        echo "$verdict"
     }
 
     # ---- Step 8: Export lookup tables to flat files for parallel workers ----
@@ -948,53 +1259,294 @@ check_fix_applied_w() {
     local hash="$1"
     local files_file="$commit_files_dir/$hash"
     local diff_file="$commit_diffs_dir/$hash"
-    [[ -s "$files_file" && -s "$diff_file" ]] || return 1
+    if [[ ! -s "$files_file" || ! -s "$diff_file" ]]; then
+        echo "INCONCLUSIVE"
+        return
+    fi
 
-    local verified=0
+    # Accumulate match evidence across ALL changed files
+    local total_added=0 total_removed=0
+    local added_matched=0 removed_matched=0
+    local any_file_checked=0
+    local removed_contiguous=0
+    local contiguous_checked=0
+
     while IFS= read -r tfile; do
         [[ -z "$tfile" || ! "$tfile" =~ \.(c|h|S)$ ]] && continue
         local fpath="$kernel_src/$tfile"
         [[ -f "$fpath" ]] || continue
 
-        local fps
-        fps=$(awk -v fname="$tfile" '
+        # Extract added lines (fix code) for this file
+        local added_lines
+        added_lines=$(awk -v fname="$tfile" '
             /^diff --git/ { in_file = index($0, fname) > 0 }
             substr($0,1,3) == "+++" { next }
             in_file && substr($0,1,1) == "+" {
                 line = substr($0, 2)
                 gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
-                if (length(line) < 15) next
+                if (length(line) < 8) next
                 if (line == "{" || line == "}") next
                 if (substr(line,1,2) == "/*" || substr(line,1,1) == "*") next
                 if (substr(line,1,8) == "#include") next
-                if (line == "break;") next
+                if (line == "break;" || line == "continue;") next
                 if (substr(line,1,6) == "return") next
-                if (substr(line,1,8) == "rcu_read") next
-                if (substr(line,1,9) == "spin_lock" || substr(line,1,11) == "spin_unlock") next
-                if (substr(line,1,10) == "mutex_lock" || substr(line,1,12) == "mutex_unlock") next
+                if (line == "else" || line == "default:") next
+                if (line == "NULL") next
                 print line
-            }' "$diff_file" | head -5)
+            }' "$diff_file" | sort -u | head -10)
 
-        [[ -z "$fps" ]] && continue
+        # Extract removed lines (vulnerable code) for this file
+        local removed_lines
+        removed_lines=$(awk -v fname="$tfile" '
+            /^diff --git/ { in_file = index($0, fname) > 0 }
+            substr($0,1,3) == "---" { next }
+            in_file && substr($0,1,1) == "-" {
+                line = substr($0, 2)
+                gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
+                if (length(line) < 8) next
+                if (line == "{" || line == "}") next
+                if (substr(line,1,2) == "/*" || substr(line,1,1) == "*") next
+                if (substr(line,1,8) == "#include") next
+                if (line == "break;" || line == "continue;") next
+                if (substr(line,1,6) == "return") next
+                if (line == "else" || line == "default:") next
+                if (line == "NULL") next
+                print line
+            }' "$diff_file" | sort -u | head -10)
 
-        local total matched
-        total=$(echo "$fps" | wc -l)
-        matched=0
-        declare -A seen_fps=()
-        while IFS= read -r fp; do
-            [[ -z "$fp" || -n "${seen_fps[$fp]+_}" ]] && continue
-            seen_fps["$fp"]=1
-            grep -qF "$fp" "$fpath" 2>/dev/null && ((matched++)) || true
-        done <<< "$fps"
-        unset seen_fps
+        local file_added=0 file_removed=0
+        [[ -n "$added_lines" ]] && file_added=$(echo "$added_lines" | wc -l)
+        [[ -n "$removed_lines" ]] && file_removed=$(echo "$removed_lines" | wc -l)
 
-        local thresh=$(( (total + 1) / 2 ))
-        if [[ "$matched" -ge "$thresh" && "$total" -gt 0 ]]; then
-            verified=1; break
+        [[ "$file_added" -eq 0 && "$file_removed" -eq 0 ]] && continue
+        ((any_file_checked++)) || true
+        total_added=$((total_added + file_added))
+        total_removed=$((total_removed + file_removed))
+
+        # Count added line matches
+        if [[ "$file_added" -gt 0 ]]; then
+            declare -A seen_a=()
+            while IFS= read -r fp; do
+                [[ -z "$fp" || -n "${seen_a[$fp]+_}" ]] && continue
+                seen_a["$fp"]=1
+                grep -qF -- "$fp" "$fpath" 2>/dev/null && ((added_matched++)) || true
+            done <<< "$added_lines"
+            unset seen_a
         fi
+
+        # Count removed line matches
+        # For short removed lines (<30 chars), use whole-line matching to
+        # avoid substring false positives (e.g., "sb->s_flags" matching
+        # inside "sbi->sb->s_flags")
+        if [[ "$file_removed" -gt 0 ]]; then
+            declare -A seen_r=()
+            while IFS= read -r fp; do
+                [[ -z "$fp" || -n "${seen_r[$fp]+_}" ]] && continue
+                seen_r["$fp"]=1
+                if [[ "${#fp}" -lt 30 ]]; then
+                    awk -v pat="$fp" '{
+                        line = $0; gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
+                        if (line == pat) { found=1; exit }
+                    } END { exit !found }' "$fpath" 2>/dev/null && ((removed_matched++)) || true
+                else
+                    grep -qF -- "$fp" "$fpath" 2>/dev/null && ((removed_matched++)) || true
+                fi
+            done <<< "$removed_lines"
+            unset seen_r
+
+            # Contiguous block check for this file's removed lines
+            if [[ "$contiguous_checked" -eq 0 && "$file_removed" -ge 1 ]]; then
+                local file_r_matched=0
+                while IFS= read -r fp; do
+                    [[ -z "$fp" ]] && continue
+                    if [[ "${#fp}" -lt 30 ]]; then
+                        awk -v pat="$fp" '{
+                            line = $0; gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
+                            if (line == pat) { found=1; exit }
+                        } END { exit !found }' "$fpath" 2>/dev/null && ((file_r_matched++)) || true
+                    else
+                        grep -qF -- "$fp" "$fpath" 2>/dev/null && ((file_r_matched++)) || true
+                    fi
+                done <<< "$removed_lines"
+                local r_ratio_file=0
+                [[ "$file_removed" -gt 0 ]] && r_ratio_file=$(( file_r_matched * 100 / file_removed ))
+
+                if [[ "$r_ratio_file" -ge 70 ]]; then
+                    contiguous_checked=1
+                    if [[ "$file_removed" -ge 2 ]]; then
+                        local line1 line2
+                        line1=$(echo "$removed_lines" | head -1)
+                        line2=$(echo "$removed_lines" | sed -n '2p')
+                        if [[ -n "$line1" && -n "$line2" ]]; then
+                            local ln_nums
+                            ln_nums=$(grep -nF -- "$line1" "$fpath" 2>/dev/null | cut -d: -f1 || true)
+                            for ln in $ln_nums; do
+                                local s=$(( ln > 1 ? ln - 1 : 1 ))
+                                local e=$(( ln + 5 ))
+                                if sed -n "${s},${e}p" "$fpath" 2>/dev/null | grep -qF -- "$line2"; then
+                                    removed_contiguous=1
+                                    break
+                                fi
+                            done
+                        fi
+                    elif [[ "$file_removed" -eq 1 ]]; then
+                        removed_contiguous=1
+                    fi
+                fi
+            fi
+        fi
+
     done < "$files_file"
 
-    [[ "$verified" -eq 1 ]] && return 0 || return 1
+    [[ "$any_file_checked" -eq 0 ]] && { echo "INCONCLUSIVE"; return; }
+
+    # Calculate aggregate ratios
+    local added_ratio=0 removed_ratio=0
+    [[ "$total_added" -gt 0 ]] && added_ratio=$(( (added_matched * 100) / total_added ))
+    [[ "$total_removed" -gt 0 ]] && removed_ratio=$(( (removed_matched * 100) / total_removed ))
+    [[ "$added_ratio" -gt 100 ]] && added_ratio=100
+    [[ "$removed_ratio" -gt 100 ]] && removed_ratio=100
+
+    # ---- Phase 1: Fingerprint-based verdict ----
+    local verdict="INCONCLUSIVE"
+
+    if [[ "$total_removed" -gt 0 && "$removed_ratio" -ge 70 && "$removed_contiguous" -eq 1 ]]; then
+        verdict="UNFIXED"
+    elif [[ "$total_added" -gt 0 && "$added_ratio" -ge 50 ]]; then
+        if [[ "$total_removed" -ge 2 && "$total_added" -ge 3 && "$removed_ratio" -lt 30 ]]; then
+            verdict="FIXED"
+        elif [[ "$total_removed" -gt 0 && "$removed_ratio" -lt 50 ]]; then
+            verdict="LIKELY_FIXED"
+        elif [[ "$total_removed" -eq 0 ]]; then
+            verdict="LIKELY_FIXED"
+        elif [[ "$removed_ratio" -ge 70 ]]; then
+            verdict="UNFIXED"
+        else
+            verdict="LIKELY_FIXED"
+        fi
+    elif [[ "$total_added" -gt 0 && "$added_ratio" -ge 30 ]]; then
+        if [[ "$total_removed" -gt 0 && "$removed_ratio" -ge 50 ]]; then
+            verdict="UNFIXED"
+        else
+            verdict="LIKELY_FIXED"
+        fi
+    elif [[ "$total_added" -eq 0 && "$total_removed" -gt 0 && "$removed_matched" -eq 0 ]]; then
+        # Removal-only fix: no added fingerprint lines (e.g., comment-only
+        # additions filtered out) but all removed (vulnerable) lines are
+        # gone from the source. Strong signal the fix was applied.
+        if [[ "$total_removed" -ge 2 ]]; then
+            verdict="FIXED"
+        else
+            verdict="LIKELY_FIXED"
+        fi
+    elif [[ "$total_removed" -gt 0 && "$removed_ratio" -ge 50 ]]; then
+        if [[ "$removed_contiguous" -eq 1 ]]; then
+            verdict="UNFIXED"
+        else
+            verdict="UNFIXED"
+        fi
+    elif [[ "$total_added" -gt 0 && "$total_added" -le 2 && "$added_matched" -gt 0 ]]; then
+        verdict="LIKELY_FIXED"
+    elif [[ "$total_added" -ge 3 && "$added_matched" -eq 0 ]]; then
+        verdict="UNFIXED"
+    fi
+
+    # ---- Phase 2: Context-aware confirmation ----
+    # Use context adjacency to upgrade/downgrade verdicts.
+    # Only runs for LIKELY_FIXED and INCONCLUSIVE. Context adjacency is
+    # unreliable for overriding UNFIXED verdicts.
+    if [[ "$verdict" == "LIKELY_FIXED" || "$verdict" == "INCONCLUSIVE" ]]; then
+        local ctx_found=0 ctx_fixed=0 ctx_unfixed=0
+
+        while IFS= read -r tfile; do
+            [[ -z "$tfile" || ! "$tfile" =~ \.(c|h|S)$ ]] && continue
+            local fpath="$kernel_src/$tfile"
+            [[ -f "$fpath" ]] || continue
+
+            # Check context+ADDED pairs (context_before AND context_after)
+            while IFS=$'\t' read -r ctx_line add_line; do
+                [[ -z "$ctx_line" || -z "$add_line" ]] && continue
+                ((ctx_found++)) || true
+                local ctx_lns
+                ctx_lns=$(grep -nF -- "$ctx_line" "$fpath" 2>/dev/null | cut -d: -f1 || true)
+                [[ -z "$ctx_lns" ]] && continue
+                local found_near=0
+                for cln in $ctx_lns; do
+                    local cs=$((cln > 3 ? cln - 3 : 1)) ce=$((cln + 3))
+                    if sed -n "${cs},${ce}p" "$fpath" 2>/dev/null | grep -qF -- "$add_line"; then
+                        found_near=1; break
+                    fi
+                done
+                if [[ "$found_near" -eq 1 ]]; then
+                    ((ctx_fixed++)) || true
+                else
+                    ((ctx_unfixed++)) || true
+                fi
+            done < <(awk -v fname="$tfile" '
+                /^diff --git/ { in_file = index($0, fname) > 0 }
+                in_file && substr($0,1,1) == " " {
+                    ctx = $0; sub(/^[ \t]+/, "", ctx); sub(/[ \t]+$/, "", ctx)
+                    if (last_add != "" && length(ctx) >= 8 && ctx !~ /^[\/\*]/) {
+                        printf "%s\t%s\n", ctx, last_add
+                    }
+                    last_add = ""
+                }
+                in_file && substr($0,1,1) == "+" && substr($0,1,3) != "+++" {
+                    add = substr($0, 2); sub(/^[ \t]+/, "", add); sub(/[ \t]+$/, "", add)
+                    if (length(ctx) >= 8 && length(add) >= 4 && ctx !~ /^[\/\*]/ && add != "{" && add != "}") {
+                        printf "%s\t%s\n", ctx, add
+                        ctx = ""
+                    }
+                    if (length(add) >= 4 && add != "{" && add != "}") last_add = add
+                }
+            ' "$diff_file")
+
+            # Check context+REMOVED pairs: is vulnerable code still near its context?
+            while IFS=$'\t' read -r ctx_line rm_line; do
+                [[ -z "$ctx_line" || -z "$rm_line" ]] && continue
+                ((ctx_found++)) || true
+                local ctx_lns
+                ctx_lns=$(grep -nF -- "$ctx_line" "$fpath" 2>/dev/null | cut -d: -f1 || true)
+                [[ -z "$ctx_lns" ]] && continue
+                local found_near=0
+                for cln in $ctx_lns; do
+                    local cs=$cln ce=$((cln + 3))
+                    if sed -n "${cs},${ce}p" "$fpath" 2>/dev/null | grep -qF -- "$rm_line"; then
+                        found_near=1; break
+                    fi
+                done
+                if [[ "$found_near" -eq 1 ]]; then
+                    ((ctx_unfixed++)) || true
+                else
+                    ((ctx_fixed++)) || true
+                fi
+            done < <(awk -v fname="$tfile" '
+                /^diff --git/ { in_file = index($0, fname) > 0 }
+                in_file && substr($0,1,1) == " " {
+                    ctx = $0; sub(/^[ \t]+/, "", ctx); sub(/[ \t]+$/, "", ctx)
+                }
+                in_file && substr($0,1,1) == "-" && substr($0,1,3) != "---" {
+                    rm = substr($0, 2); sub(/^[ \t]+/, "", rm); sub(/[ \t]+$/, "", rm)
+                    if (length(ctx) >= 8 && length(rm) >= 4 && ctx !~ /^[\/\*]/ && rm != "{" && rm != "}") {
+                        printf "%s\t%s\n", ctx, rm
+                        ctx = ""
+                    }
+                }
+            ' "$diff_file")
+        done < "$files_file"
+
+        if [[ "$ctx_found" -gt 0 ]]; then
+            if [[ "$ctx_fixed" -gt "$ctx_unfixed" ]]; then
+                if [[ "$verdict" == "INCONCLUSIVE" ]]; then verdict="LIKELY_FIXED"; fi
+            elif [[ "$ctx_unfixed" -gt "$ctx_fixed" ]]; then
+                if [[ "$verdict" == "LIKELY_FIXED" ]]; then
+                    if [[ "$ctx_unfixed" -ge $(( ctx_fixed * 2 + 1 )) && "$total_added" -le 2 ]]; then verdict="UNFIXED"; fi
+                elif [[ "$verdict" == "INCONCLUSIVE" ]]; then verdict="UNFIXED"; fi
+            fi
+        fi
+    fi
+
+    echo "$verdict"
 }
 
 declare -A config_cache=()
@@ -1043,16 +1595,41 @@ while IFS=$'\t' read -r cve_id cvss_score severity description; do
     if [[ "$config_status" == "DISABLED" ]]; then
         fix_status="NOT_APPLICABLE"
     else
+        # Try upstream fix hashes first
         if [[ -n "${cve_fix_hashes[$cve_id]+_}" ]]; then
             for uh in ${cve_fix_hashes[$cve_id]}; do
                 if [[ -n "${hash_in_repo[$uh]+_}" ]]; then
-                    if check_fix_applied_w "$uh"; then fix_status="FIXED"; break; fi
+                    verdict=$(check_fix_applied_w "$uh")
+                    case "$verdict" in
+                        FIXED)
+                            fix_status="FIXED"; break ;;
+                        UNFIXED)
+                            # Keep UNFIXED - don't let weaker verdicts override
+                            [[ "$fix_status" != "LIKELY_FIXED" ]] && fix_status="UNFIXED" ;;
+                        LIKELY_FIXED)
+                            # Upgrade from anything except FIXED
+                            [[ "$fix_status" != "FIXED" ]] && fix_status="LIKELY_FIXED" ;;
+                        INCONCLUSIVE)
+                            # Only set if we have nothing better
+                            [[ "$fix_status" == "UNFIXED" ]] && fix_status="INCONCLUSIVE" ;;
+                    esac
                 fi
             done
         fi
+        # Try backport hashes if not yet definitively FIXED
         if [[ "$fix_status" != "FIXED" && -n "${cve_backport_hashes[$cve_id]+_}" ]]; then
             for bh in ${cve_backport_hashes[$cve_id]}; do
-                if check_fix_applied_w "$bh"; then fix_status="FIXED"; break; fi
+                verdict=$(check_fix_applied_w "$bh")
+                case "$verdict" in
+                    FIXED)
+                        fix_status="FIXED"; break ;;
+                    UNFIXED)
+                        [[ "$fix_status" != "LIKELY_FIXED" ]] && fix_status="UNFIXED" ;;
+                    LIKELY_FIXED)
+                        [[ "$fix_status" != "FIXED" ]] && fix_status="LIKELY_FIXED" ;;
+                    INCONCLUSIVE)
+                        [[ "$fix_status" == "UNFIXED" ]] && fix_status="INCONCLUSIVE" ;;
+                esac
             done
         fi
     fi
@@ -1109,6 +1686,7 @@ generate_csv() {
 
     # Compute summary
     local total_cves total_fixed total_unfixed total_na
+    local total_likely_fixed total_likely_not_fixed total_inconclusive
     local cves_in_kev fixed_in_kev
     local config_enabled config_disabled config_unknown
     local sev_critical sev_high sev_medium sev_low
@@ -1116,6 +1694,8 @@ generate_csv() {
     total_cves=$(wc -l < "$RESULTS_FILE")
     total_fixed=$(awk -F'\t' '$5 == "FIXED"' "$RESULTS_FILE" | wc -l)
     total_unfixed=$(awk -F'\t' '$5 == "UNFIXED"' "$RESULTS_FILE" | wc -l)
+    total_likely_fixed=$(awk -F'\t' '$5 == "LIKELY_FIXED"' "$RESULTS_FILE" | wc -l)
+    total_inconclusive=$(awk -F'\t' '$5 == "INCONCLUSIVE"' "$RESULTS_FILE" | wc -l)
     total_na=$(awk -F'\t' '$5 == "NOT_APPLICABLE"' "$RESULTS_FILE" | wc -l)
     cves_in_kev=$(awk -F'\t' '$4 == "Yes"' "$RESULTS_FILE" | wc -l)
     fixed_in_kev=$(awk -F'\t' '$4 == "Yes" && $5 == "FIXED"' "$RESULTS_FILE" | wc -l)
@@ -1128,7 +1708,7 @@ generate_csv() {
     sev_medium=$(awk -F'\t' '$5 != "NOT_APPLICABLE" && $2 == "MEDIUM"' "$RESULTS_FILE" | wc -l)
     sev_low=$(awk -F'\t' '$5 != "NOT_APPLICABLE" && $2 == "LOW"' "$RESULTS_FILE" | wc -l)
 
-    # Unfixed severity breakdown (excluding NOT_APPLICABLE)
+    # Unfixed severity breakdown
     local unfixed_critical unfixed_high unfixed_medium unfixed_low
     unfixed_critical=$(awk -F'\t' '$5 == "UNFIXED" && $2 == "CRITICAL"' "$RESULTS_FILE" | wc -l)
     unfixed_high=$(awk -F'\t' '$5 == "UNFIXED" && $2 == "HIGH"' "$RESULTS_FILE" | wc -l)
@@ -1143,13 +1723,16 @@ generate_csv() {
         echo "# Kernel Version: $KERNEL_VERSION"
         echo "# Kernel Config: $KERNEL_CONFIG"
         echo "# Git Repository: $KERNEL_DIR"
+        [[ -n "$STABLE_DIR" ]] && echo "# Stable/Vendor Repo: $STABLE_DIR"
         echo "#"
         echo "# ===== Summary ====="
         echo "# Total CVEs affecting kernel $KERNEL_VERSION: $total_cves"
         echo "# Not applicable (config disabled): $total_na"
         echo "# Applicable CVEs: $applicable_cves"
         echo "#   Fixed via backport: $total_fixed"
+        echo "#   Likely fixed (needs review): $total_likely_fixed"
         echo "#   Unfixed (remaining): $total_unfixed"
+        echo "#   Inconclusive: $total_inconclusive"
         echo "#"
         echo "# CVEs in CISA KEV: $cves_in_kev (fixed: $fixed_in_kev, unfixed: $((cves_in_kev - fixed_in_kev)))"
         echo "#"
@@ -1192,7 +1775,9 @@ generate_csv() {
     log_info "  Not applicable:          $total_na"
     log_info "  Applicable:              $applicable_cves"
     log_info "    Fixed via backport:    $total_fixed"
+    log_info "    Likely fixed (review): $total_likely_fixed"
     log_info "    Unfixed (remaining):   $total_unfixed"
+    log_info "    Inconclusive:          $total_inconclusive"
     log_info ""
     log_info "  CVEs in CISA KEV:        $cves_in_kev (fixed: $fixed_in_kev)"
     log_info ""
@@ -1220,6 +1805,7 @@ main() {
     log_info "  Kernel Source:   $KERNEL_SRC"
     log_info "  Kernel Config:   $KERNEL_CONFIG"
     log_info "  Git Repository:  $KERNEL_DIR"
+    [[ -n "$STABLE_DIR" ]] && log_info "  Stable/Vendor:   $STABLE_DIR"
     log_info "  KEV File:        $KEV_FILE"
     log_info "  NVD Feeds:       $NVD_FEEDS_DIR"
     log_info "  Output:          $OUTPUT_DIR"
