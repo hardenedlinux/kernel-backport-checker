@@ -53,7 +53,7 @@ Kernel Backport Checker automates the detection of:
 │     (git.kernel.org, github.com/torvalds, kernel.dance, cgit)   │
 │  5. Build CONFIG mapping from kernel Makefiles/Kbuild            │
 │  6. Check git log for CVE mentions (upstream + stable repos)     │
-│  7. Verify fix: fingerprint + moved-line + context matching      │
+│  7. Verify fix: fingerprint + line-swap + moved-line + context   │
 └─────────────────────────────────────────────────────────────────┘
          ▲                                    ▲
          │                                    │
@@ -83,11 +83,21 @@ Kernel Backport Checker automates the detection of:
 
 3. **Dual-signal fix verification**: Extracts both "added lines" (fix code) and "removed lines" (vulnerable code) from upstream fix commits. Checks whether fix code is present in the target source AND whether vulnerable code has been removed, producing nuanced verdicts rather than binary yes/no.
 
-4. **Moved-line detection**: Lines that appear in both the added and removed sets of a diff are identified as moved code (relocated within the file, not truly added/removed). These are excluded from removed-line counting to prevent inflated removed ratios that would incorrectly block FIXED classification.
+4. **Moved-line detection**: Lines that appear in both the added and removed sets of a diff are identified as moved code (relocated within the file, not truly added/removed). These are excluded from **both** added-line and removed-line matching to prevent inflated ratios from code that was merely relocated, not introduced or eliminated.
 
-5. **Contiguous block matching**: When removed (vulnerable) lines match highly in the target source (>=70%), checks whether they appear as a contiguous block (genuine vulnerable code still present, confirming UNFIXED) or scattered across unrelated locations (common pattern reuse).
+5. **Line-swap ordering detection (Phase 0.5)**: When all distinctive lines are "moved" (identical in both `+` and `-`), the fix is a line reordering. The tool extracts ordering pairs from the diff's removed view (unfixed order) and added view (fixed order), then checks which order appears in the target source. Uses a two-pass awk (END block) to handle both upward and downward line movements, and skips blank lines without resetting pair detection state.
 
-6. **Parallel processing**: Splits CVE processing across multiple worker processes. Each worker receives a chunk of CVEs plus serialized lookup tables, avoiding shared-state bottlenecks. Uses `xargs -P` for NVD feed scanning, fix ref extraction, and diff extraction.
+6. **Code-relocation detection**: When all added lines are also moved lines (`total_moved >= total_added`), the high added-line match rate comes from the original (pre-fix) location, not from the fix being applied. Combined with high removed-line presence, this pattern indicates the code block was merely relocated between functions and the vulnerability persists.
+
+7. **Small-fix guard**: Fixes with very few distinctive lines (1-2 added or 0-1 removed) are treated conservatively. In large kernel source files with repetitive patterns (e.g., the same locking function called from many sites), finding 1-2 lines is statistically expected by chance and cannot reliably indicate the fix was applied.
+
+8. **Contiguous block matching**: When removed (vulnerable) lines match highly in the target source (>=70%), checks whether they appear as a contiguous block (genuine vulnerable code still present, confirming UNFIXED) or scattered across unrelated locations (common pattern reuse).
+
+9. **Conservative verdict aggregation**: NVD references often include backport commit hashes for multiple stable branches targeting different kernel versions. When checked against the target kernel, mismatched branches (e.g., a 5.10 backport checked against a 6.8 kernel) produce unreliable verdicts due to code context differences. The aggregation prioritizes UNFIXED over LIKELY_FIXED to prevent a single rogue hash from overriding correct verdicts.
+
+10. **Validated Phase 2 context check**: The context-aware adjacency check (Phase 2) is used only to **downgrade** verdicts (LIKELY_FIXED to UNFIXED, INCONCLUSIVE to UNFIXED), never to **upgrade** (INCONCLUSIVE to LIKELY_FIXED). Validation showed that context-based upgrades produced a 100% false positive rate because common code patterns naturally appear near similar context at unrelated locations in large files. The Phase 2 check filters boilerplate added lines (goto, return, break, variable declarations, error checks) using the same rules as the fingerprint filter.
+
+11. **Parallel processing**: Splits CVE processing across multiple worker processes. Each worker receives a chunk of CVEs plus serialized lookup tables, avoiding shared-state bottlenecks. Uses `xargs -P` for NVD feed scanning, fix ref extraction, and diff extraction.
 
 ## Implementation Details
 
@@ -104,7 +114,7 @@ Kernel Backport Checker automates the detection of:
 | `build_git_hash_index()` | Indexes all commit hashes from upstream + stable repos for fast lookup |
 | `process_results()` | Exports lookup tables, splits CVEs into chunks, spawns parallel workers |
 | Worker script | Per-chunk processing: CONFIG mapping, fix verification (fingerprint + context), verdict aggregation |
-| `check_fix_applied()` | Dual-signal analysis: added/removed line matching with moved-line detection + contiguous block check + context adjacency |
+| `check_fix_applied()` | Multi-phase analysis: line-swap ordering → fingerprint matching → context adjacency |
 | `generate_csv()` | Produces final CSV report with summary statistics and severity breakdown |
 
 ### Algorithm: Fix Verification
@@ -124,39 +134,59 @@ For each CVE:
           mutex/spin/rcu lock calls, braces, NULL, else, default
         - Up to 10 distinctive lines per file per direction (added/removed)
      c. Detect moved lines (same line in both added and removed sets)
-        - Moved lines are excluded from removed-line counting
+        - Moved lines are excluded from BOTH added and removed matching
      d. Check both against target kernel source (per-file matching)
         - Short lines (<40 chars added, <30 chars removed): whole-line matching
         - Longer lines: substring matching (distinctive enough)
      e. Accumulate match evidence across ALL changed files
-     f. Compute added_ratio and removed_ratio (0-100%)
-     g. Decision matrix (Phase 1 - fingerprint-based):
-        - Removed ≥70% + contiguous + added ≥80% → LIKELY_FIXED
-        - Removed ≥70% + contiguous + added <80% → UNFIXED
-        - Added ≥50% + removed ≥2 + added ≥70% + removed <15% → FIXED
-        - Added ≥50% + removed <50% → LIKELY_FIXED
-        - Added ≥50% + no removed lines → INCONCLUSIVE (pure-addition)
-        - Added ≥40% + removed ≥50% → UNFIXED
-        - Added ≥40% + removed <50% → LIKELY_FIXED
-        - Added =0 + removed >0 + none matched + removed ≥2 → FIXED (removal-only)
-        - Removed ≥50% → UNFIXED
-        - Added ≤2 lines matched → INCONCLUSIVE (too weak)
-        - Added ≥3 lines, 0% match → UNFIXED (fix absent)
-        - Otherwise → INCONCLUSIVE
-     h. Context-aware confirmation (Phase 2):
+
+     Phase 0.5 — Line-swap ordering check:
+        - Triggers when total_moved > 0 AND total_removed = 0
+          (all removed lines are identical to added lines = line reordering)
+        - Uses two-pass awk (END block) for order-independent moved-line detection
+        - Extracts ordering pairs from REMOVED view (unfixed order) and
+          ADDED view (fixed order), skipping blank lines
+        - Checks which ordering exists in the target source
+        - If unfixed ordering found → UNFIXED (regardless of fixed ordering
+          elsewhere — vulnerability exists in at least one code path)
+        - If only fixed ordering found → LIKELY_FIXED
+
+     Phase 1 — Fingerprint-based verdict:
+        f. Compute added_ratio and removed_ratio (0-100%)
+        g. Guard checks applied in order:
+           - Code-relocation: total_moved >= total_added → UNFIXED
+           - Small fix: total_added <= 2 with removed >= 70% → UNFIXED
+           - Weak removed: total_removed <= 1 with removed >= 70% → UNFIXED
+        h. Decision matrix:
+           - Removed ≥70% + contiguous + added ≥80% (guards passed) → INCONCLUSIVE
+           - Removed ≥70% + contiguous + added <80% → UNFIXED
+           - Added ≥50% + removed ≥2 + added ≥70% + removed <15% → FIXED
+           - Added ≥50% + no removed lines → INCONCLUSIVE (pure-addition)
+           - Added ≥50% + removed ≥70% (guards passed) → INCONCLUSIVE
+           - Added ≥50% + remaining cases → INCONCLUSIVE
+           - Added ≥40% + removed ≥50% → UNFIXED
+           - Added =0 + removed >0 + none matched + removed ≥2 → FIXED (removal-only)
+           - Added =0 + removed >0 + none matched + removed =1 → LIKELY_FIXED
+           - Removed ≥50% → UNFIXED
+           - Added ≤2 lines matched → INCONCLUSIVE (too weak)
+           - Added ≥3 lines, 0% match → UNFIXED (fix absent)
+           - Otherwise → INCONCLUSIVE
+
+     Phase 2 — Context-aware confirmation (downgrade only):
         - Only runs for LIKELY_FIXED and INCONCLUSIVE verdicts
         - Extract unchanged context lines adjacent to added/removed lines
+        - Filter boilerplate added lines using fingerprint-quality rules
+          (goto, return, break, declarations, error checks)
         - Check adjacency in target source (±3 lines)
-        - Context majority fixed: INCONCLUSIVE → LIKELY_FIXED
-          (LIKELY_FIXED stays LIKELY_FIXED - context alone not reliable
-          enough for FIXED upgrade)
         - Context majority unfixed: LIKELY_FIXED → UNFIXED (if strong
           signal + weak added match), INCONCLUSIVE → UNFIXED
-  6. Aggregate verdicts across all hashes:
+        - Context majority fixed: no upgrade (validated: unreliable)
+
+  6. Aggregate verdicts across all hashes (conservative):
      - FIXED requires: ≥1 FIXED vote, zero UNFIXED votes, FIXED > LIKELY_FIXED
-     - Mixed FIXED + UNFIXED → LIKELY_FIXED (conservative)
-     - Any LIKELY_FIXED → LIKELY_FIXED
-     - Any UNFIXED → UNFIXED
+     - Mixed FIXED + UNFIXED → LIKELY_FIXED
+     - Any UNFIXED (with no FIXED) → UNFIXED
+     - Any LIKELY_FIXED (with no UNFIXED or FIXED) → LIKELY_FIXED
      - All INCONCLUSIVE → INCONCLUSIVE
      - No fix info from any source → INCONCLUSIVE
 ```
@@ -168,20 +198,20 @@ Each CVE in the output report is assigned one of the following verdicts:
 | Verdict | Meaning | Trigger Condition |
 |---------|---------|-------------------|
 | `FIXED` | The fix has been backported. | Fix code (added lines) strongly present (>=70% match) AND vulnerable code mostly gone (<15% match with >=2 removed lines), OR removal-only fix where all vulnerable code (>=2 removed lines) is gone from source. Requires zero UNFIXED votes across all commit hashes. |
-| `LIKELY_FIXED` | The fix is probably backported, but evidence is partial. Needs manual review. | Fix code partially present (40-69% match), OR fix and vulnerable code both present (>=80% added + >=70% removed), OR context-aware matching gives mixed signals, OR mixed FIXED+UNFIXED votes across commit hashes. These CVEs should be reviewed manually to confirm whether the fix was applied in a different form. |
-| `UNFIXED` | The vulnerability is still present. | Vulnerable code (removed lines) is still present in the target source (>=70% match confirmed by contiguous block check, or >=50% match), OR fix code is completely absent (0% match on >=3 distinctive lines), OR context-aware matching confirms fix was not inserted at the expected location. |
-| `INCONCLUSIVE` | Cannot determine fix status with confidence. | Signals are ambiguous: too few distinctive lines to judge (<=2 matched), pure-addition fix with no removed-line evidence, source file does not exist in target kernel, no extractable commit hash, no fix info from any source, or both fix and context matching produce no usable signal. |
+| `LIKELY_FIXED` | The fix is probably backported, but evidence is limited. Needs manual review. | Removal-only fix where exactly 1 vulnerable line is gone from the source (evidence present but quantity is limited), OR mixed FIXED+UNFIXED votes across commit hashes for different stable branches. |
+| `UNFIXED` | The vulnerability is still present. | Vulnerable code (removed lines) is still present in the target source (>=70% match confirmed by contiguous block check, or >=50% match), OR fix code is completely absent (0% match on >=3 distinctive lines), OR line-swap ordering check confirms unfixed code order, OR code-relocation detection identifies moved code at original location, OR context-aware matching confirms fix was not inserted at the expected location. |
+| `INCONCLUSIVE` | Cannot determine fix status with confidence. | Signals are ambiguous: too few distinctive lines to judge (<=2 matched), pure-addition fix with no removed-line evidence, both fix code and vulnerable code patterns found at similar rates (common in files with repetitive code patterns), source file does not exist in target kernel, no extractable commit hash, no fix info from any source, or context matching produces no usable signal. |
 | `NOT_APPLICABLE` | The CVE does not affect this kernel build. | All source files modified by the fix commit are under CONFIG options that are disabled (`=n` or absent) in the kernel `.config`. The vulnerable subsystem is not compiled into the kernel. |
 
 #### Interpreting the verdicts
 
 **For security auditing**, focus on `UNFIXED` CVEs first — these have the highest confidence that the vulnerability is present. Then review `LIKELY_FIXED` CVEs to confirm whether the fix was genuinely applied. `INCONCLUSIVE` CVEs should be reviewed when resources allow.
 
-**`FIXED` vs `LIKELY_FIXED`**: A `FIXED` verdict means the tool found strong evidence: >=70% of distinctive fix lines present with vulnerable code mostly gone (<15% remaining), or all vulnerable code removed in a removal-only fix. Additionally, no commit hash may produce an UNFIXED vote. `LIKELY_FIXED` means partial evidence — the fix may have been applied in a slightly different form (e.g., a vendor-specific adaptation), or only part of a multi-commit fix series has been backported, or different commit hashes produce conflicting signals. These are the primary candidates for manual review.
+**`FIXED` vs `LIKELY_FIXED`**: A `FIXED` verdict means the tool found strong evidence: >=70% of distinctive fix lines present with vulnerable code mostly gone (<15% remaining), or all vulnerable code removed in a removal-only fix. Additionally, no commit hash may produce an UNFIXED vote. `LIKELY_FIXED` is now reserved for cases with limited but positive evidence: removal-only fixes with a single vulnerable line absent from the source, or mixed signals across different stable branch hashes. LIKELY_FIXED is no longer assigned for ambiguous fingerprint matches, which are classified as INCONCLUSIVE instead.
 
 **`NOT_APPLICABLE` confidence**: This verdict relies on the CONFIG mapping derived from kernel Makefiles. The mapping covers `obj-$(CONFIG_XXX)` patterns and directory-level config guards, but composite objects (e.g., `xxx-objs`) and conditional compilation within source files are not fully captured. Some CVEs may show `UNKNOWN` config status when the mapping cannot determine the relevant CONFIG option.
 
-**`INCONCLUSIVE` causes**: A CVE receives `INCONCLUSIVE` when the tool exhausts all detection methods — fingerprint matching, removed-line analysis, and context-aware matching — without producing a definitive signal. The specific conditions that lead to `INCONCLUSIVE` are:
+**`INCONCLUSIVE` causes**: A CVE receives `INCONCLUSIVE` when the tool exhausts all detection methods — fingerprint matching, line-swap ordering, removed-line analysis, and context-aware matching — without producing a definitive signal. The specific conditions that lead to `INCONCLUSIVE` are:
 
 1. **Zero distinctive lines after filtering** — The fix commit only modifies comments, whitespace, or boilerplate code shorter than 8 characters. After filtering out common patterns (`return`, `break`, `{`, `}`, `#include`, etc.), no fingerprint lines remain to match against.
 
@@ -189,11 +219,11 @@ Each CVE in the output report is assigned one of the following verdicts:
 
 3. **No extractable commit hash** — The NVD entry for the CVE does not reference any git commit URLs, or the referenced commits do not exist in either the upstream or stable repositories provided.
 
-4. **Partial match in the ambiguous zone** — Some fix fingerprint lines match in the target source but not enough for `LIKELY_FIXED` (requires >=40% added ratio). This includes cases where only 1-2 distinctive lines match (regardless of percentage), which could be either a partial backport or a coincidental pattern match. The tool cannot distinguish between these cases.
+4. **Both fix code and vulnerable code present** — The fix's added lines AND removed lines are both found in the target source at high rates. This typically occurs in large files with repetitive code patterns (e.g., the same locking/unlocking sequence used across many functions). Without location-aware analysis, the tool cannot distinguish between "fix applied alongside residual similar code" and "fix not applied but similar code exists elsewhere." This is classified as INCONCLUSIVE rather than LIKELY_FIXED because validation showed that these ambiguous matches are unreliable positive signals.
 
-5. **Conflicting signals across multiple files** — The fix touches multiple files, and fingerprint evidence is contradictory: some files suggest the fix is applied while others suggest it is not. When context-aware matching also produces mixed results (some context+added pairs found adjacent, others not), the tool cannot determine an overall verdict.
+5. **Pure-addition fix with no removed lines** — The fix only adds new code without removing any existing code. Without removed-line evidence to confirm the vulnerability was present, added-line matches alone are insufficient (they may coincidentally match existing code).
 
-6. **Pure-addition fix with no removed lines** — The fix only adds new code without removing any existing code. Without removed-line evidence to confirm the vulnerability was present, added-line matches alone are insufficient (they may coincidentally match existing code).
+6. **Weak fingerprint signal** — Only 1-2 distinctive lines match in the target source (regardless of percentage), or added-line match rate is between 40-49%. This could be either a partial backport or a coincidental pattern match. The tool cannot distinguish between these cases.
 
 7. **Context lines not found in target** — The context-aware fallback extracts unchanged lines both before and after each added/removed line in the diff, then checks whether both appear adjacent in the target source (within ±3 lines). If the surrounding code has been significantly refactored between the upstream version and the target kernel, the context lines no longer exist, and adjacency checks fail.
 
@@ -274,9 +304,9 @@ The tool produces `<output-dir>/backport-report.csv` with comment headers contai
 # Not applicable (config disabled): 200
 # Applicable CVEs: 1034
 #   Fixed via backport: 400
-#   Likely fixed (needs review): 150
-#   Unfixed (remaining): 300
-#   Inconclusive: 184
+#   Likely fixed (needs review): 3
+#   Unfixed (remaining): 450
+#   Inconclusive: 181
 # ...
 CVE-ID,Severity,CVSS-Score,In-CISA-KEV,Fix-Status,Affected-Config,Config-Status,Description
 ```
@@ -323,7 +353,7 @@ Four scripts are provided to validate the accuracy of the checker's verdicts. Ea
 
 ### validate-single-cve.sh
 
-Validates a single CVE verdict by attempting to apply the upstream fix patch to the kernel source. If the patch applies cleanly, the fix is NOT present (ground truth = UNFIXED).
+Validates a single CVE verdict by attempting to apply the upstream fix patch to the kernel source. If the patch applies cleanly, the fix is NOT present (ground truth = UNFIXED). If the patch does not apply, the result is untestable (context mismatch or fix already present — cannot distinguish).
 
 ```bash
 ./validate-single-cve.sh \
@@ -334,24 +364,37 @@ Validates a single CVE verdict by attempting to apply the upstream fix patch to 
     -o /path/to/output
 ```
 
+| Option | Description |
+|--------|-------------|
+| `-c` | CVE identifier, e.g. CVE-2024-12345 (required) |
+| `-s` | Path to kernel source tree (required) |
+| `-d` | Path to upstream Linux kernel git repository (required) |
+| `-b` | Path to stable/vendor git repository (required) |
+| `-o` | Path to checker output directory containing `.nvd_fix_refs_*.tsv` (required) |
+| `-r` | Path to backport-report.csv (default: `OUTPUT/backport-report.csv`) |
+
 Output format (pipe-delimited):
 ```
 CVE-2024-12345|UNFIXED|CORRECT|
 CVE-2024-67890|FIXED|FP_FIXED|abc123def456
 CVE-2024-11111|LIKELY_FIXED|FP_LIKELY|abc123def456
+CVE-2024-22222|LIKELY_FIXED|PATCH_CONFLICT_LIKELY|
 ```
 
 | Result | Meaning |
 |--------|---------|
-| `CORRECT` | Verdict matches ground truth |
+| `CORRECT` | Verdict matches ground truth (patch applies = fix not present, verdict is UNFIXED/INCONCLUSIVE) |
 | `FP_FIXED` | False positive: checker says FIXED but fix not present |
-| `FP_LIKELY` | Soft false positive: checker says LIKELY_FIXED but fix not present |
-| `PATCH_CONFLICT` | Patch doesn't apply (fix may be present or context mismatch) |
+| `FP_LIKELY` | False positive: checker says LIKELY_FIXED but fix not present |
+| `PATCH_CONFLICT` | Patch doesn't apply for UNFIXED verdict (context mismatch) |
+| `PATCH_CONFLICT_FIXED` | Patch doesn't apply for FIXED verdict (unconfirmed — could be correct or context mismatch) |
+| `PATCH_CONFLICT_LIKELY` | Patch doesn't apply for LIKELY_FIXED verdict (unconfirmed) |
+| `PATCH_CONFLICT_INCONC` | Patch doesn't apply for INCONCLUSIVE verdict |
 | `UNTESTABLE` | No fix commit hash available |
 
 ### validate-all.sh
 
-Runs `validate-single-cve.sh` in parallel across all applicable CVEs and produces an aggregate summary.
+Runs `validate-single-cve.sh` in parallel across applicable CVEs and produces an aggregate summary. Supports filtering by verdict to target specific categories (e.g., validating only LIKELY_FIXED CVEs).
 
 ```bash
 # Validate all applicable CVEs
@@ -360,7 +403,15 @@ Runs `validate-single-cve.sh` in parallel across all applicable CVEs and produce
     -d /path/to/linux \
     -b /path/to/stable \
     -o /path/to/output \
-    -j 15
+    -j 4
+
+# Validate only LIKELY_FIXED CVEs
+./validate-all.sh \
+    -s /path/to/linux-6.8.1 \
+    -d /path/to/linux \
+    -b /path/to/stable \
+    -o /path/to/output \
+    -t LIKELY_FIXED -j 4
 
 # Validate a random sample of 500 CVEs
 ./validate-all.sh \
@@ -368,7 +419,7 @@ Runs `validate-single-cve.sh` in parallel across all applicable CVEs and produce
     -d /path/to/linux \
     -b /path/to/stable \
     -o /path/to/output \
-    -n 500 -j 15
+    -n 500 -j 4
 ```
 
 | Option | Description |
@@ -378,14 +429,22 @@ Runs `validate-single-cve.sh` in parallel across all applicable CVEs and produce
 | `-b` | Path to stable/vendor git repository (required) |
 | `-o` | Path to checker output directory (required) |
 | `-r` | Path to backport-report.csv (default: `OUTPUT/backport-report.csv`) |
-| `-j` | Number of parallel workers (default: 15) |
+| `-j` | Number of parallel workers (default: 4) |
 | `-n` | Validate only N random CVEs (default: all) |
+| `-t` | Only validate CVEs with this verdict (e.g., `LIKELY_FIXED`, `FIXED`, `UNFIXED`) |
 
 Results are saved to `OUTPUT/validation-results.txt`.
 
 ### validate-with-patches.sh
 
-End-to-end detection test: selects N random UNFIXED CVEs whose patches apply cleanly, applies the patches to the kernel source, re-runs the checker, verifies each CVE is detected as FIXED or LIKELY_FIXED, then reverts all patches.
+End-to-end detection test: selects N random UNFIXED CVEs whose patches apply cleanly, applies the patches to the kernel source, re-runs the checker, verifies each CVE is detected as FIXED or LIKELY_FIXED, then reverts all patches. Includes a trap handler to ensure patches are always reverted, even on interruption.
+
+The script runs in 5 steps:
+1. **Find patchable CVEs** - Scans UNFIXED CVEs for those with 1-5 fix hashes and 1-10 changed files whose patches apply cleanly (`patch -p1 --dry-run`)
+2. **Apply patches** - Applies the selected fix patches to the kernel source tree
+3. **Re-run checker** - Clears stale results and re-runs `kernel-backport-checker.sh` with the patched source
+4. **Check results** - Compares the new report against expectations: each patched CVE should now be FIXED or LIKELY_FIXED. Reports false negatives (still UNFIXED) and misses (INCONCLUSIVE)
+5. **Revert patches** - Reverts all applied patches in reverse order (also triggered on EXIT/INT/TERM via trap)
 
 ```bash
 ./validate-with-patches.sh \
@@ -402,7 +461,7 @@ End-to-end detection test: selects N random UNFIXED CVEs whose patches apply cle
 | Option | Description |
 |--------|-------------|
 | `-s` | Path to kernel source tree (required) |
-| `-d` | Path to upstream Linux git repository (required) |
+| `-d` | Path to upstream Linux kernel git repository (required) |
 | `-b` | Path to stable/vendor git repository (required) |
 | `-o` | Path to checker output directory (required) |
 | `-k` | Path to kernel .config file (required) |
@@ -413,7 +472,7 @@ End-to-end detection test: selects N random UNFIXED CVEs whose patches apply cle
 
 ### find-patchable-cves.sh
 
-Finds UNFIXED CVEs whose upstream fix patches can be cleanly applied to the kernel source. Outputs a TSV list suitable for use with other validation scripts.
+Finds UNFIXED CVEs whose upstream fix patches can be cleanly applied to the kernel source. Useful for building test sets for patch-apply validation. Outputs a TSV list to stdout suitable for use with other validation scripts.
 
 ```bash
 ./find-patchable-cves.sh \
@@ -423,6 +482,16 @@ Finds UNFIXED CVEs whose upstream fix patches can be cleanly applied to the kern
     -o /path/to/output \
     -n 200
 ```
+
+| Option | Description |
+|--------|-------------|
+| `-s` | Path to kernel source tree (required) |
+| `-d` | Path to upstream Linux kernel git repository (required) |
+| `-b` | Path to stable/vendor git repository (required) |
+| `-o` | Path to checker output directory (required) |
+| `-n` | Max number of patchable CVEs to find (default: 200) |
+
+The script filters CVEs to those with 1-5 fix hashes and patches that modify 1-10 files, then tests each patch with `patch -p1 --dry-run` to confirm clean application.
 
 Output (stdout, tab-separated):
 ```

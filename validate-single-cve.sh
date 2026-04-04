@@ -10,8 +10,10 @@
 #     CORRECT              - Verdict matches ground truth
 #     FP_FIXED             - False positive: checker says FIXED but fix NOT present
 #     FP_LIKELY            - Soft false positive: checker says LIKELY_FIXED but fix NOT present
-#     PATCH_CONFLICT       - Patch doesn't apply (fix may be present or context mismatch)
-#     PATCH_CONFLICT_INCONC - Same but verdict was INCONCLUSIVE
+#     PATCH_CONFLICT_FIXED - Patch fails for FIXED verdict (unconfirmed)
+#     PATCH_CONFLICT_LIKELY- Patch fails for LIKELY_FIXED verdict (unconfirmed)
+#     PATCH_CONFLICT       - Patch fails for UNFIXED verdict (context mismatch)
+#     PATCH_CONFLICT_INCONC- Patch fails for INCONCLUSIVE verdict
 #     UNTESTABLE           - No fix hash available for testing
 #
 # Usage:
@@ -71,8 +73,13 @@ REPORT="${REPORT:-$OUTPUT/backport-report.csv}"
 FIX_REFS=$(ls "$OUTPUT"/.nvd_fix_refs_*.tsv 2>/dev/null | head -1)
 [[ -f "$FIX_REFS" ]] || { echo "Error: NVD fix refs not found in $OUTPUT" >&2; exit 1; }
 
-verdict=$(grep "^$CVE," "$REPORT" | awk -F',' '{print $5}')
-hashes=$(grep -P "^${CVE}\t" "$FIX_REFS" | awk -F'\t' '{print $2}')
+# Cleanup temp files on exit
+_tmpfiles=()
+cleanup() { rm -f "${_tmpfiles[@]}" 2>/dev/null; }
+trap cleanup EXIT
+
+verdict=$(grep "^${CVE}," "$REPORT" | awk -F',' '{print $5}')
+hashes=$(awk -F'\t' -v cve="$CVE" '$1 == cve {print $2}' "$FIX_REFS")
 
 if [[ -z "$hashes" ]]; then
     echo "$CVE|$verdict|UNTESTABLE|"
@@ -89,27 +96,32 @@ for hash in $hashes; do
     else continue; fi
 
     tmpfile=$(mktemp)
+    _tmpfiles+=("$tmpfile")
     git -C "$repo" format-patch -1 --stdout "$short" > "$tmpfile" 2>/dev/null
     if patch -p1 --dry-run -d "$KERNEL_SRC" < "$tmpfile" > /dev/null 2>&1; then
         patch_applies=1
         applied_hash="$short"
+        break
     fi
-    rm -f "$tmpfile"
-    [[ "$patch_applies" -eq 1 ]] && break
 done
 
 if [[ "$patch_applies" -eq 1 ]]; then
-    # Fix NOT present (patch can be applied)
+    # Fix NOT present (patch can be applied) -> ground truth is UNFIXED
     case "$verdict" in
         FIXED)        echo "$CVE|$verdict|FP_FIXED|$applied_hash" ;;
         LIKELY_FIXED) echo "$CVE|$verdict|FP_LIKELY|$applied_hash" ;;
         *)            echo "$CVE|$verdict|CORRECT|" ;;
     esac
 else
-    # Patch doesn't apply (fix present or context conflict)
+    # Patch doesn't apply cleanly. Two possible reasons:
+    #   a) Fix IS present (patch already applied) -> FIXED/LIKELY_FIXED correct
+    #   b) Context mismatch between kernel versions -> cannot determine
+    # We cannot distinguish (a) from (b), so mark as untestable conflict.
     case "$verdict" in
+        FIXED)        echo "$CVE|$verdict|PATCH_CONFLICT_FIXED|" ;;
+        LIKELY_FIXED) echo "$CVE|$verdict|PATCH_CONFLICT_LIKELY|" ;;
         UNFIXED)      echo "$CVE|$verdict|PATCH_CONFLICT|" ;;
         INCONCLUSIVE) echo "$CVE|$verdict|PATCH_CONFLICT_INCONC|" ;;
-        *)            echo "$CVE|$verdict|CORRECT|" ;;
+        *)            echo "$CVE|$verdict|PATCH_CONFLICT|" ;;
     esac
 fi

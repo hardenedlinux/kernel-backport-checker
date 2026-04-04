@@ -1,0 +1,11 @@
+# Kernel Binary Backport Checker - Python dependencies
+#
+# Required:
+#   (none - uses only Python standard library for core functionality)
+#
+# Recommended (enables deeper binary analysis):
+r2pipe>=0.1.2          # radare2 Python bindings for binary analysis
+#
+# Optional (enhances symbol extraction):
+# vmlinux-to-elf       # Reconstruct ELF from raw kernel blobs with kallsyms
+#                      # Install separately: pip install vmlinux-to-elf

@@ -62,11 +62,13 @@ FIX_REFS=$(ls "$OUTPUT_DIR"/.nvd_fix_refs_*.tsv 2>/dev/null | head -1)
 [[ -f "$REPORT" ]]   || { echo "Error: Report not found: $REPORT" >&2; exit 1; }
 [[ -f "$FIX_REFS" ]] || { echo "Error: Fix refs not found in $OUTPUT_DIR" >&2; exit 1; }
 
-# Get UNFIXED CVEs with 1-5 fix hashes
+# Cleanup temp files on exit
 _tmp_unfixed=$(mktemp)
 _tmp_few=$(mktemp)
 _tmp_cand=$(mktemp)
+trap 'rm -f "$_tmp_unfixed" "$_tmp_few" "$_tmp_cand"' EXIT
 
+# Get UNFIXED CVEs with 1-5 fix hashes
 grep ',UNFIXED,' "$REPORT" | awk -F',' '{print $1}' | sort > "$_tmp_unfixed"
 awk -F'\t' '{print $1}' "$FIX_REFS" | sort | uniq -c | \
     awk '$1 >= 1 && $1 <= 5 {print $2}' | sort > "$_tmp_few"
@@ -74,7 +76,7 @@ comm -12 "$_tmp_unfixed" "$_tmp_few" | shuf > "$_tmp_cand"
 
 found=0
 while read cve && [[ "$found" -lt "$COUNT" ]]; do
-    hashes=$(grep -P "^${cve}\t" "$FIX_REFS" | awk -F'\t' '{print $2}')
+    hashes=$(awk -F'\t' -v c="$cve" '$1 == c {print $2}' "$FIX_REFS")
     for hash in $hashes; do
         short="${hash:0:12}"
         repo=""
@@ -88,7 +90,7 @@ while read cve && [[ "$found" -lt "$COUNT" ]]; do
 
         if [[ "$nfiles" -ge 1 && "$nfiles" -le 10 ]] && \
            patch -p1 --dry-run -d "$KERNEL_SRC" < "$tmpfile" > /dev/null 2>&1; then
-            echo -e "$cve\t$hash\t$nfiles"
+            printf '%s\t%s\t%s\n' "$cve" "$hash" "$nfiles"
             found=$((found + 1))
             rm -f "$tmpfile"
             break
@@ -97,5 +99,4 @@ while read cve && [[ "$found" -lt "$COUNT" ]]; do
     done
 done < "$_tmp_cand"
 
-rm -f "$_tmp_unfixed" "$_tmp_few" "$_tmp_cand"
 echo "Found $found patchable CVEs" >&2

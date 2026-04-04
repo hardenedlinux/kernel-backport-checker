@@ -1,7 +1,7 @@
 #!/bin/bash
 # validate-all.sh - Validate CVE verdicts in the backport report
 #
-# Runs validate-single-cve.sh in parallel for every applicable CVE in the
+# Runs validate-single-cve.sh in parallel for applicable CVEs in the
 # report, then prints a summary of false positives and false negatives.
 #
 # Usage:
@@ -23,16 +23,17 @@ Required:
 
 Optional:
   -r REPORT    Path to backport-report.csv (default: OUTPUT/backport-report.csv)
-  -j JOBS      Number of parallel workers (default: 15)
+  -j JOBS      Number of parallel workers (default: 4)
   -n COUNT     Validate only COUNT random CVEs (default: all)
+  -t VERDICT   Only validate CVEs with this verdict (e.g. LIKELY_FIXED, FIXED)
   -h           Show this help
 EOF
     exit 1
 }
 
-KERNEL_SRC="" UPSTREAM="" STABLE="" OUTPUT_DIR="" REPORT="" JOBS=15 COUNT=0
+KERNEL_SRC="" UPSTREAM="" STABLE="" OUTPUT_DIR="" REPORT="" JOBS=4 COUNT=0 FILTER_VERDICT=""
 
-while getopts "s:d:b:o:r:j:n:h" opt; do
+while getopts "s:d:b:o:r:j:n:t:h" opt; do
     case "$opt" in
         s) KERNEL_SRC="$OPTARG" ;;
         d) UPSTREAM="$OPTARG" ;;
@@ -41,6 +42,7 @@ while getopts "s:d:b:o:r:j:n:h" opt; do
         r) REPORT="$OPTARG" ;;
         j) JOBS="$OPTARG" ;;
         n) COUNT="$OPTARG" ;;
+        t) FILTER_VERDICT="$OPTARG" ;;
         h) usage ;;
         *) usage ;;
     esac
@@ -71,26 +73,58 @@ echo "Source:     $KERNEL_SRC"
 echo "Upstream:   $UPSTREAM"
 echo "Stable:     $STABLE"
 echo "Jobs:       $JOBS"
+[[ -n "$FILTER_VERDICT" ]] && echo "Filter:     $FILTER_VERDICT only"
 echo ""
 
-# Get applicable CVEs (excluding NOT_APPLICABLE and header lines)
+# Get applicable CVEs
 CVE_LIST=$(mktemp)
-if [[ "$COUNT" -gt 0 ]]; then
-    grep -v ',NOT_APPLICABLE,' "$REPORT" | grep "^CVE-" | awk -F',' '{print $1}' | shuf | head -"$COUNT" | sort > "$CVE_LIST"
-    echo "Validating $COUNT random CVEs..."
+trap 'rm -f "$CVE_LIST"' EXIT
+
+if [[ -n "$FILTER_VERDICT" ]]; then
+    # Filter by specific verdict
+    grep ",${FILTER_VERDICT}," "$REPORT" | grep "^CVE-" | awk -F',' '{print $1}' | sort > "$CVE_LIST"
 else
+    # All applicable (exclude NOT_APPLICABLE)
     grep -v ',NOT_APPLICABLE,' "$REPORT" | grep "^CVE-" | awk -F',' '{print $1}' | sort > "$CVE_LIST"
-    echo "Validating all $(wc -l < "$CVE_LIST") applicable CVEs..."
 fi
+
+if [[ "$COUNT" -gt 0 ]]; then
+    shuf "$CVE_LIST" | head -"$COUNT" | sort > "${CVE_LIST}.tmp"
+    mv "${CVE_LIST}.tmp" "$CVE_LIST"
+fi
+
+total_cves=$(wc -l < "$CVE_LIST")
+echo "Validating $total_cves CVEs..."
 echo ""
 
-# Run validation in parallel — pass all required args to each worker
-cat "$CVE_LIST" | xargs -P"$JOBS" -I{} \
-    bash "$SCRIPT_DIR/validate-single-cve.sh" \
-        -c "{}" -s "$KERNEL_SRC" -d "$UPSTREAM" -b "$STABLE" -o "$OUTPUT_DIR" -r "$REPORT" \
-    > "$RESULTS_FILE" 2>/dev/null
+# Run validation in parallel with per-worker append for safe output
+# Each worker produces exactly one line, appended atomically
+> "$RESULTS_FILE"
 
-rm -f "$CVE_LIST"
+_progress_file=$(mktemp)
+echo "0" > "$_progress_file"
+trap 'rm -f "$CVE_LIST" "$_progress_file"' EXIT
+
+# Use xargs with append mode - each single-line echo is atomic on Linux
+< "$CVE_LIST" xargs -P"$JOBS" -I{} bash -c '
+    result=$("'"$SCRIPT_DIR"'/validate-single-cve.sh" \
+        -c "{}" -s "'"$KERNEL_SRC"'" -d "'"$UPSTREAM"'" -b "'"$STABLE"'" \
+        -o "'"$OUTPUT_DIR"'" -r "'"$REPORT"'" 2>/dev/null)
+    if [[ -n "$result" ]]; then
+        echo "$result" >> "'"$RESULTS_FILE"'"
+        # Progress counter (best effort, not locked)
+        n=$(cat "'"$_progress_file"'" 2>/dev/null || echo 0)
+        echo $((n + 1)) > "'"$_progress_file"'" 2>/dev/null
+        if (( (n + 1) % 100 == 0 )); then
+            echo "  Progress: $((n + 1)) / '"$total_cves"'" >&2
+        fi
+    fi
+'
+
+echo ""
+
+# Sort results for deterministic output
+sort -o "$RESULTS_FILE" "$RESULTS_FILE"
 
 # Summarize results
 echo "=== Results ==="
@@ -98,21 +132,25 @@ echo ""
 awk -F'|' '{print $3}' "$RESULTS_FILE" | sort | uniq -c | sort -rn
 echo ""
 
-correct=$(grep -c '|CORRECT|' "$RESULTS_FILE" 2>/dev/null || true)
-fp_fixed=$(grep -c '|FP_FIXED|' "$RESULTS_FILE" 2>/dev/null || true)
-fp_likely=$(grep -c '|FP_LIKELY|' "$RESULTS_FILE" 2>/dev/null || true)
-patch_conflict=$(grep -c '|PATCH_CONFLICT|' "$RESULTS_FILE" 2>/dev/null || true)
-patch_conflict_inconc=$(grep -c '|PATCH_CONFLICT_INCONC|' "$RESULTS_FILE" 2>/dev/null || true)
-untestable=$(grep -c '|UNTESTABLE|' "$RESULTS_FILE" 2>/dev/null || true)
-correct=${correct:-0}; fp_fixed=${fp_fixed:-0}; fp_likely=${fp_likely:-0}
-patch_conflict=${patch_conflict:-0}; patch_conflict_inconc=${patch_conflict_inconc:-0}; untestable=${untestable:-0}
+# Count each result type using exact field matching to avoid substring issues
+correct=$(awk -F'|' '$3 == "CORRECT"' "$RESULTS_FILE" | wc -l)
+fp_fixed=$(awk -F'|' '$3 == "FP_FIXED"' "$RESULTS_FILE" | wc -l)
+fp_likely=$(awk -F'|' '$3 == "FP_LIKELY"' "$RESULTS_FILE" | wc -l)
+patch_conflict=$(awk -F'|' '$3 == "PATCH_CONFLICT"' "$RESULTS_FILE" | wc -l)
+patch_conflict_inconc=$(awk -F'|' '$3 == "PATCH_CONFLICT_INCONC"' "$RESULTS_FILE" | wc -l)
+patch_conflict_fixed=$(awk -F'|' '$3 == "PATCH_CONFLICT_FIXED"' "$RESULTS_FILE" | wc -l)
+patch_conflict_likely=$(awk -F'|' '$3 == "PATCH_CONFLICT_LIKELY"' "$RESULTS_FILE" | wc -l)
+untestable=$(awk -F'|' '$3 == "UNTESTABLE"' "$RESULTS_FILE" | wc -l)
+
 total=$(wc -l < "$RESULTS_FILE")
 testable=$((correct + fp_fixed + fp_likely))
 
 echo "=== Summary ==="
-echo "Total CVEs:              $total"
-echo "Testable:                $testable"
-echo "Correct:                 $correct ($(( testable > 0 ? correct * 100 / testable : 0 ))%)"
+echo "Total CVEs validated:    $total"
+echo "Testable (patch works):  $testable"
+if [[ "$testable" -gt 0 ]]; then
+    echo "Correct:                 $correct ($(( correct * 100 / testable ))%)"
+fi
 echo ""
 echo "FALSE POSITIVES:"
 echo "  FIXED FP:              $fp_fixed"
@@ -121,20 +159,24 @@ echo "  LIKELY_FIXED FP:       $fp_likely"
 if [[ "$fp_fixed" -gt 0 ]]; then
     echo ""
     echo "=== FIXED False Positives ==="
-    grep '|FP_FIXED|' "$RESULTS_FILE" | sort
+    awk -F'|' '$3 == "FP_FIXED"' "$RESULTS_FILE" | sort
 fi
 
 if [[ "$fp_likely" -gt 0 ]]; then
-    likely_total=$(grep -c ',LIKELY_FIXED,' "$REPORT" 2>/dev/null || true)
-    likely_total=${likely_total:-0}
+    likely_total=$(grep -c ',LIKELY_FIXED,' "$REPORT" 2>/dev/null || echo 0)
+    echo ""
+    echo "=== LIKELY_FIXED False Positives ==="
+    awk -F'|' '$3 == "FP_LIKELY"' "$RESULTS_FILE" | sort
     echo ""
     echo "LIKELY_FIXED FP rate:    $fp_likely / $likely_total ($(( likely_total > 0 ? fp_likely * 100 / likely_total : 0 ))%)"
 fi
 
 echo ""
-echo "PATCH CONFLICTS (not errors - context mismatch between kernel versions):"
+echo "PATCH CONFLICTS (untestable - context mismatch between kernel versions):"
 echo "  UNFIXED conflicts:     $patch_conflict"
 echo "  INCONCLUSIVE conflicts:$patch_conflict_inconc"
+echo "  FIXED conflicts:       $patch_conflict_fixed  (verdict unconfirmed)"
+echo "  LIKELY_FIXED conflicts:$patch_conflict_likely  (verdict unconfirmed)"
 echo ""
 echo "Untestable (no hash):    $untestable"
 echo ""

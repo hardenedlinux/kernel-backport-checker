@@ -74,6 +74,30 @@ FIX_REFS=$(ls "$OUTPUT_DIR"/.nvd_fix_refs_*.tsv 2>/dev/null | head -1)
 [[ -f "$REPORT" ]]    || { echo "Error: Run kernel-backport-checker.sh first to generate report" >&2; exit 1; }
 [[ -f "$FIX_REFS" ]]  || { echo "Error: NVD fix refs not found in $OUTPUT_DIR" >&2; exit 1; }
 
+# Track applied patches for cleanup
+PATCHABLE=$(mktemp)
+_tmpfiles=()
+
+revert_patches() {
+    if [[ -s "$PATCHABLE" ]]; then
+        echo ""
+        echo "[CLEANUP] Reverting applied patches..."
+        tac "$PATCHABLE" | while IFS=$'\t' read -r cve hash nfiles; do
+            short="${hash:0:12}"
+            if git -C "$UPSTREAM" cat-file -e "$short" 2>/dev/null; then repo="$UPSTREAM"
+            else repo="$STABLE"; fi
+            tmpfile=$(mktemp)
+            git -C "$repo" format-patch -1 --stdout "$short" > "$tmpfile" 2>/dev/null
+            patch -p1 -R -d "$KERNEL_SRC" < "$tmpfile" > /dev/null 2>&1
+            rm -f "$tmpfile"
+        done
+        echo "[CLEANUP] All patches reverted"
+    fi
+    rm -f "$PATCHABLE" "${_tmpfiles[@]}" 2>/dev/null
+}
+
+trap revert_patches EXIT INT TERM
+
 echo "=========================================="
 echo " Patch-Apply Validation ($COUNT CVEs)"
 echo "=========================================="
@@ -82,17 +106,17 @@ echo "=========================================="
 echo ""
 echo "[1/5] Finding UNFIXED CVEs with cleanly-applying patches..."
 
-CANDIDATES=$(mktemp)
+CANDIDATES=$(mktemp); _tmpfiles+=("$CANDIDATES")
 grep ',UNFIXED,' "$REPORT" | awk -F',' '{print $1}' | sort > "$CANDIDATES"
 
-CANDIDATES_FEW=$(mktemp)
+CANDIDATES_FEW=$(mktemp); _tmpfiles+=("$CANDIDATES_FEW")
 awk -F'\t' '{print $1}' "$FIX_REFS" | sort | uniq -c | awk '$1 >= 1 && $1 <= 5 {print $2}' | sort > "${CANDIDATES_FEW}.hashes"
+_tmpfiles+=("${CANDIDATES_FEW}.hashes")
 comm -12 "$CANDIDATES" "${CANDIDATES_FEW}.hashes" | shuf | head -$((COUNT * 2)) > "$CANDIDATES_FEW"
-rm -f "${CANDIDATES_FEW}.hashes"
 
-PATCHABLE=$(mktemp)
+> "$PATCHABLE"
 while read cve; do
-    hashes=$(grep -P "^${cve}\t" "$FIX_REFS" | awk -F'\t' '{print $2}')
+    hashes=$(awk -F'\t' -v c="$cve" '$1 == c {print $2}' "$FIX_REFS")
     for hash in $hashes; do
         short="${hash:0:12}"
         repo=""
@@ -105,7 +129,7 @@ while read cve; do
         git -C "$repo" format-patch -1 --stdout "$short" > "$tmpfile" 2>/dev/null
         if [[ "$nfiles" -ge 1 && "$nfiles" -le 10 ]] && \
            patch -p1 --dry-run -d "$KERNEL_SRC" < "$tmpfile" > /dev/null 2>&1; then
-            echo -e "$cve\t$hash\t$nfiles" >> "$PATCHABLE"
+            printf '%s\t%s\t%s\n' "$cve" "$hash" "$nfiles" >> "$PATCHABLE"
         fi
         rm -f "$tmpfile"
         break
@@ -117,8 +141,6 @@ head -"$COUNT" "$PATCHABLE" > "${PATCHABLE}.final"
 mv "${PATCHABLE}.final" "$PATCHABLE"
 actual=$(wc -l < "$PATCHABLE")
 echo "  Found $actual patchable CVEs"
-
-rm -f "$CANDIDATES" "$CANDIDATES_FEW"
 
 # Step 2: Apply patches
 echo ""
@@ -139,9 +161,11 @@ while IFS=$'\t' read -r cve hash nfiles; do
 done < "$PATCHABLE"
 echo "  Applied: $applied / $actual"
 
-# Step 3: Re-run checker
+# Step 3: Re-run checker (clear stale results first)
 echo ""
 echo "[3/5] Re-running checker..."
+
+rm -f "$OUTPUT_DIR/backport-report.csv" "$OUTPUT_DIR/.results.tsv"
 
 "$SCRIPT_DIR/kernel-backport-checker.sh" \
     -s "$KERNEL_SRC" \
@@ -158,14 +182,15 @@ echo ""
 echo "[4/5] Checking detection results..."
 NEW_REPORT="$OUTPUT_DIR/backport-report.csv"
 
-fixed=0; likely=0; unfixed=0; inconclusive=0
+fixed=0; likely=0; unfixed=0; inconclusive=0; notfound=0
 while IFS=$'\t' read -r cve hash nfiles; do
     status=$(grep "^$cve," "$NEW_REPORT" | awk -F',' '{print $5}')
     case "$status" in
         FIXED) fixed=$((fixed + 1)) ;;
         LIKELY_FIXED) likely=$((likely + 1)) ;;
-        UNFIXED) unfixed=$((unfixed + 1)) ;;
-        INCONCLUSIVE) inconclusive=$((inconclusive + 1)) ;;
+        UNFIXED) unfixed=$((unfixed + 1)); echo "  FALSE NEGATIVE: $cve ($status)" ;;
+        INCONCLUSIVE) inconclusive=$((inconclusive + 1)); echo "  MISSED: $cve ($status)" ;;
+        *) notfound=$((notfound + 1)) ;;
     esac
 done < "$PATCHABLE"
 
@@ -175,23 +200,13 @@ echo "  FIXED:        $fixed / $actual"
 echo "  LIKELY_FIXED: $likely / $actual"
 echo "  UNFIXED:      $unfixed / $actual  (false negatives)"
 echo "  INCONCLUSIVE: $inconclusive / $actual"
-echo "  Detection:    $(( actual > 0 ? (fixed + likely) * 100 / actual : 0 ))%"
+detected=$((fixed + likely))
+echo "  Detection:    $detected / $actual ($(( actual > 0 ? detected * 100 / actual : 0 ))%)"
 
-# Step 5: Revert patches
+# Step 5: Revert patches (handled by trap, but call explicitly for clean output)
 echo ""
 echo "[5/5] Reverting patches..."
-tac "$PATCHABLE" | while IFS=$'\t' read -r cve hash nfiles; do
-    short="${hash:0:12}"
-    if git -C "$UPSTREAM" cat-file -e "$short" 2>/dev/null; then repo="$UPSTREAM"
-    else repo="$STABLE"; fi
-    tmpfile=$(mktemp)
-    git -C "$repo" format-patch -1 --stdout "$short" > "$tmpfile" 2>/dev/null
-    patch -p1 -R -d "$KERNEL_SRC" < "$tmpfile" > /dev/null 2>&1
-    rm -f "$tmpfile"
-done
-echo "  All patches reverted"
-
-rm -f "$PATCHABLE"
+# trap handler will do the actual revert on EXIT
 
 echo ""
 echo "=========================================="

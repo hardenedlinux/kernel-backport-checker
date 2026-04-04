@@ -858,6 +858,7 @@ process_results() {
         local added_matched=0 removed_matched=0
         local any_file_checked=0
         local removed_contiguous=0
+        local total_moved=0
         # Store all removed lines for contiguous check later
         local all_removed_lines=""
         local contiguous_checked=0
@@ -910,6 +911,14 @@ process_results() {
                 done <<< "$added_lines"
             fi
 
+            # Build set of removed lines for symmetric moved-line detection
+            declare -A removed_set=()
+            if [[ -n "$removed_lines" ]]; then
+                while IFS= read -r fp; do
+                    [[ -n "$fp" ]] && removed_set["$fp"]=1
+                done <<< "$removed_lines"
+            fi
+
             # Identify moved lines (appear in both added and removed)
             # Moved lines are code that was relocated within the file, not
             # truly added/removed. Exclude from removed counting to prevent
@@ -924,17 +933,22 @@ process_results() {
 
             total_added=$((total_added + file_added))
             total_removed=$((total_removed + file_removed - file_moved))
+            total_moved=$((total_moved + file_moved))
 
             # Count added line matches
             # Use whole-line matching to avoid substring false positives
             # (e.g., "kfree(ptr)" matching "kfree(ptr->member)").
             # For long lines (>=40 chars), use substring matching as they
             # are distinctive enough and may have minor formatting differences.
+            # Skip moved lines (also in removed_lines) - finding them in source
+            # doesn't indicate fix was applied, just that code existed before.
             if [[ "$file_added" -gt 0 ]]; then
                 declare -A seen_added=()
                 while IFS= read -r fp; do
                     [[ -z "$fp" || -n "${seen_added[$fp]+_}" ]] && continue
                     seen_added["$fp"]=1
+                    # Skip moved lines
+                    [[ -n "${removed_set[$fp]+_}" ]] && continue
                     if [[ "${#fp}" -lt 40 ]]; then
                         awk -v pat="$fp" '{
                             line = $0; gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
@@ -1020,6 +1034,7 @@ process_results() {
                 fi
             fi
             unset added_set
+            unset removed_set
 
         done < "$files_file"
 
@@ -1036,16 +1051,163 @@ process_results() {
         [[ "$added_ratio" -gt 100 ]] && added_ratio=100
         [[ "$removed_ratio" -gt 100 ]] && removed_ratio=100
 
+        # ---- Phase 0.5: Line-swap ordering check ----
+        # When all removed lines are "moved" (identical content in both + and -),
+        # the fingerprint check fails because both added/removed match the same
+        # text. For line-swap fixes, check if the source has lines in the UNFIXED
+        # order (matching the removed view of the diff) to detect vulnerability.
+        if [[ "$total_moved" -gt 0 && "$total_removed" -le 0 ]]; then
+            local swap_unfixed=0 swap_fixed=0
+
+            while IFS= read -r target_file; do
+                [[ -z "$target_file" ]] && continue
+                [[ "$target_file" =~ \.(c|h|S)$ ]] || continue
+                local full_path="$KERNEL_SRC/$target_file"
+                [[ -f "$full_path" ]] || continue
+
+                # Extract moved lines (appear in both + and - of the diff)
+                local moved_lines_list
+                moved_lines_list=$(awk -v fname="$target_file" '
+                    /^diff --git/ { in_file = index($0, fname) > 0 }
+                    in_file && substr($0,1,1) == "-" && substr($0,1,3) != "---" {
+                        line = substr($0, 2)
+                        gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
+                        if (length(line) >= 8) rm[line] = 1
+                    }
+                    in_file && substr($0,1,1) == "+" && substr($0,1,3) != "+++" {
+                        line = substr($0, 2)
+                        gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
+                        if (length(line) >= 8) add[line] = 1
+                    }
+                    END { for (l in add) if (l in rm) print l }
+                ' "$diff_file" | sort -u)
+
+                [[ -z "$moved_lines_list" ]] && continue
+
+                declare -A swap_moved_set=()
+                while IFS= read -r ml; do
+                    [[ -n "$ml" ]] && swap_moved_set["$ml"]=1
+                done <<< "$moved_lines_list"
+
+                # Extract unfixed ordering pairs from REMOVED view of the diff.
+                # Skip + lines to see the original (unfixed) line sequence.
+                # Output: line_A\tline_B where A appears before B in unfixed version.
+                while IFS=$'\t' read -r line_a line_b; do
+                    [[ -z "$line_a" || -z "$line_b" ]] && continue
+                    # At least one must be a moved line
+                    [[ -z "${swap_moved_set[$line_a]+_}" && -z "${swap_moved_set[$line_b]+_}" ]] && continue
+                    local a_lns
+                    a_lns=$(grep -nF -- "$line_a" "$full_path" 2>/dev/null | cut -d: -f1 || true)
+                    [[ -z "$a_lns" ]] && continue
+                    for aln in $a_lns; do
+                        local s=$((aln + 1)) e=$((aln + 3))
+                        if sed -n "${s},${e}p" "$full_path" 2>/dev/null | grep -qF -- "$line_b"; then
+                            ((swap_unfixed++)) || true
+                            break
+                        fi
+                    done
+                done < <(awk -v fname="$target_file" '
+                    /^diff --git/ { in_file = index($0, fname) > 0; prev = ""; prev_type = "" }
+                    in_file && substr($0,1,1) == "+" && substr($0,1,3) != "+++" { next }
+                    in_file && substr($0,1,1) == " " {
+                        line = $0; gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
+                        if (length(line) >= 8 && line != "{" && line != "}" && substr(line,1,2) != "/*" && substr(line,1,1) != "*") {
+                            if (prev_type == "rm") printf "%s\t%s\n", prev, line
+                            prev = line; prev_type = "ctx"
+                        }
+                    }
+                    in_file && substr($0,1,1) == "-" && substr($0,1,3) != "---" {
+                        line = substr($0, 2); gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
+                        if (length(line) >= 8 && line != "{" && line != "}") {
+                            if (prev_type == "ctx") printf "%s\t%s\n", prev, line
+                            prev = line; prev_type = "rm"
+                        }
+                    }
+                ' "$diff_file")
+
+                # Extract fixed ordering pairs from ADDED view of the diff.
+                # Skip - lines to see the fixed line sequence.
+                while IFS=$'\t' read -r line_a line_b; do
+                    [[ -z "$line_a" || -z "$line_b" ]] && continue
+                    [[ -z "${swap_moved_set[$line_a]+_}" && -z "${swap_moved_set[$line_b]+_}" ]] && continue
+                    local a_lns
+                    a_lns=$(grep -nF -- "$line_a" "$full_path" 2>/dev/null | cut -d: -f1 || true)
+                    [[ -z "$a_lns" ]] && continue
+                    for aln in $a_lns; do
+                        local s=$((aln + 1)) e=$((aln + 3))
+                        if sed -n "${s},${e}p" "$full_path" 2>/dev/null | grep -qF -- "$line_b"; then
+                            ((swap_fixed++)) || true
+                            break
+                        fi
+                    done
+                done < <(awk -v fname="$target_file" '
+                    /^diff --git/ { in_file = index($0, fname) > 0; prev = ""; prev_type = "" }
+                    in_file && substr($0,1,1) == "-" && substr($0,1,3) != "---" { next }
+                    in_file && substr($0,1,1) == " " {
+                        line = $0; gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
+                        if (length(line) >= 8 && line != "{" && line != "}" && substr(line,1,2) != "/*" && substr(line,1,1) != "*") {
+                            if (prev_type == "add") printf "%s\t%s\n", prev, line
+                            prev = line; prev_type = "ctx"
+                        }
+                    }
+                    in_file && substr($0,1,1) == "+" && substr($0,1,3) != "+++" {
+                        line = substr($0, 2); gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
+                        if (length(line) >= 8 && line != "{" && line != "}") {
+                            if (prev_type == "ctx") printf "%s\t%s\n", prev, line
+                            prev = line; prev_type = "add"
+                        }
+                    }
+                ' "$diff_file")
+
+                unset swap_moved_set
+            done < "$files_file"
+
+            # If unfixed ordering found, the vulnerability is still present
+            # regardless of whether fixed ordering also exists elsewhere
+            if [[ "$swap_unfixed" -gt 0 ]]; then
+                echo "UNFIXED"
+                return
+            elif [[ "$swap_fixed" -gt 0 ]]; then
+                echo "LIKELY_FIXED"
+                return
+            fi
+            # No ordering signal -> fall through to normal verdict logic
+        fi
+
         # ---- Phase 1: Fingerprint-based verdict ----
         local verdict="INCONCLUSIVE"
 
         if [[ "$total_removed" -gt 0 && "$removed_ratio" -ge 70 && "$removed_contiguous" -eq 1 ]]; then
             if [[ "$total_added" -gt 0 && "$added_ratio" -ge 80 ]]; then
-                # Both fix code AND vulnerable code pattern present. This
-                # happens when the same code pattern exists in multiple
-                # functions and the fix only changes some occurrences.
-                # Fix code is strongly present, so not truly UNFIXED.
-                verdict="LIKELY_FIXED"
+                if [[ "$total_moved" -gt 0 && "$total_moved" -ge "$total_added" ]]; then
+                    # All added lines are "moved" (identical in both + and -).
+                    # The high added_ratio comes from matching the ORIGINAL
+                    # (pre-fix) location, not from the fix being applied.
+                    # This is a code-relocation fix where a code block is moved
+                    # between functions. The vulnerable code is still present
+                    # at the original location.
+                    verdict="UNFIXED"
+                elif [[ "$total_added" -le 2 ]]; then
+                    # Very small fix (1-2 distinctive lines). Finding them in
+                    # the source is expected by chance in files with repetitive
+                    # patterns (e.g., same function called from many sites).
+                    # High removed_ratio confirms vulnerability is present;
+                    # the weak added signal cannot reliably override that.
+                    verdict="UNFIXED"
+                elif [[ "$total_removed" -le 1 ]]; then
+                    # Only 0-1 non-moved removed lines: the high removed_ratio
+                    # is trivially achieved (one common line found in a large
+                    # file). This is too weak to corroborate the added-line
+                    # matches, which are likely from unrelated locations.
+                    verdict="UNFIXED"
+                else
+                    # Both fix code AND vulnerable code pattern present.
+                    # Validated: this still produces false positives because
+                    # similar code patterns repeat across functions in large
+                    # kernel source files. Without location awareness, this
+                    # is genuinely inconclusive.
+                    verdict="INCONCLUSIVE"
+                fi
             else
                 verdict="UNFIXED"
             fi
@@ -1058,8 +1220,9 @@ process_results() {
                 verdict="FIXED"
             elif [[ "$total_removed" -gt 0 && "$removed_ratio" -lt 50 ]]; then
                 # Fix code present but removed signal weak (1 line or 30-50%):
-                # ambiguous, could be partial fix or coincidental matches
-                verdict="LIKELY_FIXED"
+                # ambiguous, could be partial fix or coincidental matches.
+                # Validated: these cases have 100% false positive rate.
+                verdict="INCONCLUSIVE"
             elif [[ "$total_removed" -eq 0 ]]; then
                 # Pure-addition fix: no removed lines to confirm vulnerability was
                 # present. Added lines may coincidentally match existing code.
@@ -1068,21 +1231,33 @@ process_results() {
                 verdict="INCONCLUSIVE"
             elif [[ "$removed_ratio" -ge 70 ]]; then
                 # Removed code >=70% present but fix code also present (>=50%).
-                # Since we're inside added_ratio >= 50 branch, the fix code IS
-                # present. The vulnerable pattern likely exists in other
-                # functions. Classify as LIKELY_FIXED not UNFIXED.
-                verdict="LIKELY_FIXED"
+                if [[ "$total_moved" -gt 0 && "$total_moved" -ge "$total_added" ]]; then
+                    # Code-relocation: added lines match original location only
+                    verdict="UNFIXED"
+                elif [[ "$total_added" -le 2 ]]; then
+                    # Very small fix with high removed ratio - added matches
+                    # are likely coincidental from other call sites
+                    verdict="UNFIXED"
+                elif [[ "$total_removed" -le 1 ]]; then
+                    # Single removed-line match too weak to corroborate
+                    verdict="UNFIXED"
+                else
+                    # Both present - genuinely inconclusive without location awareness
+                    verdict="INCONCLUSIVE"
+                fi
             else
                 # Remaining cases (50%<=removed<70%):
-                # ambiguous signal, needs review
-                verdict="LIKELY_FIXED"
+                # ambiguous signal - validated: unreliable for LIKELY_FIXED
+                verdict="INCONCLUSIVE"
             fi
         elif [[ "$total_added" -gt 0 && "$added_ratio" -ge 40 ]]; then
             if [[ "$total_removed" -gt 0 && "$removed_ratio" -ge 50 ]]; then
                 # Partial fix match + vulnerable code substantially present -> UNFIXED
                 verdict="UNFIXED"
             elif [[ "$total_removed" -gt 0 ]]; then
-                verdict="LIKELY_FIXED"
+                # Weak added match (40-49%) with some removed present:
+                # ambiguous - validated: unreliable for LIKELY_FIXED
+                verdict="INCONCLUSIVE"
             else
                 # Pure addition with weak match (40-49%) -> INCONCLUSIVE
                 verdict="INCONCLUSIVE"
@@ -1128,6 +1303,23 @@ process_results() {
                 # Extracts both context_before+added AND context_after+added pairs
                 while IFS=$'\t' read -r ctx_line add_line; do
                     [[ -z "$ctx_line" || -z "$add_line" ]] && continue
+                    # Skip boilerplate added lines that pass the weak awk filter
+                    # but fail the fingerprint filter. These common patterns
+                    # (goto, return, break, declarations, etc.) exist at many
+                    # locations and produce false positive context matches.
+                    [[ ${#add_line} -lt 8 ]] && continue
+                    [[ "$add_line" == "break;" || "$add_line" == "continue;" ]] && continue
+                    [[ "$add_line" == return* ]] && continue
+                    [[ "$add_line" == goto\ * ]] && continue
+                    [[ "$add_line" == else || "$add_line" == "default:" ]] && continue
+                    [[ "$add_line" == "NULL" ]] && continue
+                    # Skip simple variable declarations (match fingerprint filter)
+                    [[ "$add_line" =~ ^(int|long|bool|void|unsigned|struct|enum|const|static)\ [a-z_]+\;$ ]] && continue
+                    [[ "$add_line" =~ ^(int|long)\ (ret|err|rc|res|status)\;$ ]] && continue
+                    [[ "$add_line" =~ ^(int|long)\ (ret|err|rc|res|status)\ =\ 0\;$ ]] && continue
+                    # Skip simple error checks
+                    [[ "$add_line" =~ ^if\ \((err|ret|rc)\)$ ]] && continue
+                    [[ "$add_line" =~ ^if\ \((err|ret|rc|res)\ \<\ 0\)$ ]] && continue
                     ((ctx_found++)) || true
                     local ctx_lns
                     ctx_lns=$(grep -nF -- "$ctx_line" "$full_path" 2>/dev/null | cut -d: -f1 || true)
@@ -1203,14 +1395,14 @@ process_results() {
 
             if [[ "$ctx_found" -gt 0 ]]; then
                 if [[ "$ctx_fixed" -gt "$ctx_unfixed" ]]; then
-                    # Context majority says fix applied
-                    if [[ "$verdict" == "INCONCLUSIVE" ]]; then
-                        verdict="LIKELY_FIXED"
-                    fi
-                    # LIKELY_FIXED stays LIKELY_FIXED - context adjacency alone
-                    # is not reliable enough to upgrade to FIXED. Substring
-                    # matching produces too many false context matches in large
-                    # kernel source files.
+                    # Context majority says fix applied.
+                    # However, do NOT upgrade INCONCLUSIVE to LIKELY_FIXED.
+                    # Validation shows context adjacency produces 100% false
+                    # positive rate for this upgrade path: common code patterns
+                    # (lock/unlock, error checks, etc.) naturally appear near
+                    # similar context at unrelated locations in large files.
+                    # LIKELY_FIXED stays LIKELY_FIXED (context confirms).
+                    :
                 elif [[ "$ctx_unfixed" -gt "$ctx_fixed" ]]; then
                     # Context majority says fix NOT applied
                     if [[ "$verdict" == "LIKELY_FIXED" ]]; then
@@ -1344,6 +1536,7 @@ check_fix_applied_w() {
     local added_matched=0 removed_matched=0
     local any_file_checked=0
     local removed_contiguous=0
+    local total_moved=0
     local contiguous_checked=0
 
     while IFS= read -r tfile; do
@@ -1426,6 +1619,14 @@ check_fix_applied_w() {
             done <<< "$added_lines"
         fi
 
+        # Build set of removed lines for symmetric moved-line detection
+        declare -A removed_set_w=()
+        if [[ -n "$removed_lines" ]]; then
+            while IFS= read -r fp; do
+                [[ -n "$fp" ]] && removed_set_w["$fp"]=1
+            done <<< "$removed_lines"
+        fi
+
         # Identify moved lines (appear in both added and removed)
         local file_moved=0
         if [[ "$file_removed" -gt 0 && "$file_added" -gt 0 ]]; then
@@ -1437,15 +1638,20 @@ check_fix_applied_w() {
 
         total_added=$((total_added + file_added))
         total_removed=$((total_removed + file_removed - file_moved))
+        total_moved=$((total_moved + file_moved))
 
         # Count added line matches
         # Use whole-line matching for short lines (<40 chars) to avoid
         # substring false positives. Long lines use substring matching.
+        # Skip moved lines (also in removed_lines) - finding them in source
+        # doesn't indicate fix was applied, just that code existed before.
         if [[ "$file_added" -gt 0 ]]; then
             declare -A seen_a=()
             while IFS= read -r fp; do
                 [[ -z "$fp" || -n "${seen_a[$fp]+_}" ]] && continue
                 seen_a["$fp"]=1
+                # Skip moved lines
+                [[ -n "${removed_set_w[$fp]+_}" ]] && continue
                 if [[ "${#fp}" -lt 40 ]]; then
                     awk -v pat="$fp" '{
                         line = $0; gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
@@ -1528,6 +1734,7 @@ check_fix_applied_w() {
             fi
         fi
         unset added_set_w
+        unset removed_set_w
 
     done < "$files_file"
 
@@ -1543,15 +1750,145 @@ check_fix_applied_w() {
     [[ "$added_ratio" -gt 100 ]] && added_ratio=100
     [[ "$removed_ratio" -gt 100 ]] && removed_ratio=100
 
+    # ---- Phase 0.5: Line-swap ordering check ----
+    # When all removed lines are "moved" (identical content in both + and -),
+    # the fingerprint check fails because both added/removed match the same
+    # text. For line-swap fixes, check if the source has lines in the UNFIXED
+    # order (matching the removed view of the diff) to detect vulnerability.
+    if [[ "$total_moved" -gt 0 && "$total_removed" -le 0 ]]; then
+        local swap_unfixed=0 swap_fixed=0
+
+        while IFS= read -r tfile; do
+            [[ -z "$tfile" || ! "$tfile" =~ \.(c|h|S)$ ]] && continue
+            local fpath="$kernel_src/$tfile"
+            [[ -f "$fpath" ]] || continue
+
+            # Extract moved lines (appear in both + and - of the diff)
+            local moved_lines_list
+            moved_lines_list=$(awk -v fname="$tfile" '
+                /^diff --git/ { in_file = index($0, fname) > 0 }
+                in_file && substr($0,1,1) == "-" && substr($0,1,3) != "---" {
+                    line = substr($0, 2)
+                    gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
+                    if (length(line) >= 8) rm[line] = 1
+                }
+                in_file && substr($0,1,1) == "+" && substr($0,1,3) != "+++" {
+                    line = substr($0, 2)
+                    gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
+                    if (length(line) >= 8) add[line] = 1
+                }
+                END { for (l in add) if (l in rm) print l }
+            ' "$diff_file" | sort -u)
+
+            [[ -z "$moved_lines_list" ]] && continue
+
+            declare -A swap_moved_set=()
+            while IFS= read -r ml; do
+                [[ -n "$ml" ]] && swap_moved_set["$ml"]=1
+            done <<< "$moved_lines_list"
+
+            # Extract unfixed ordering pairs from REMOVED view of the diff.
+            # Skip + lines to see the original (unfixed) line sequence.
+            while IFS=$'\t' read -r line_a line_b; do
+                [[ -z "$line_a" || -z "$line_b" ]] && continue
+                [[ -z "${swap_moved_set[$line_a]+_}" && -z "${swap_moved_set[$line_b]+_}" ]] && continue
+                local a_lns
+                a_lns=$(grep -nF -- "$line_a" "$fpath" 2>/dev/null | cut -d: -f1 || true)
+                [[ -z "$a_lns" ]] && continue
+                for aln in $a_lns; do
+                    local s=$((aln + 1)) e=$((aln + 3))
+                    if sed -n "${s},${e}p" "$fpath" 2>/dev/null | grep -qF -- "$line_b"; then
+                        ((swap_unfixed++)) || true
+                        break
+                    fi
+                done
+            done < <(awk -v fname="$tfile" '
+                /^diff --git/ { in_file = index($0, fname) > 0; prev = ""; prev_type = "" }
+                in_file && substr($0,1,1) == "+" && substr($0,1,3) != "+++" { next }
+                in_file && substr($0,1,1) == " " {
+                    line = $0; gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
+                    if (length(line) >= 8 && line != "{" && line != "}" && substr(line,1,2) != "/*" && substr(line,1,1) != "*") {
+                        if (prev_type == "rm") printf "%s\t%s\n", prev, line
+                        prev = line; prev_type = "ctx"
+                    }
+                }
+                in_file && substr($0,1,1) == "-" && substr($0,1,3) != "---" {
+                    line = substr($0, 2); gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
+                    if (length(line) >= 8 && line != "{" && line != "}") {
+                        if (prev_type == "ctx") printf "%s\t%s\n", prev, line
+                        prev = line; prev_type = "rm"
+                    }
+                }
+            ' "$diff_file")
+
+            # Extract fixed ordering pairs from ADDED view of the diff.
+            while IFS=$'\t' read -r line_a line_b; do
+                [[ -z "$line_a" || -z "$line_b" ]] && continue
+                [[ -z "${swap_moved_set[$line_a]+_}" && -z "${swap_moved_set[$line_b]+_}" ]] && continue
+                local a_lns
+                a_lns=$(grep -nF -- "$line_a" "$fpath" 2>/dev/null | cut -d: -f1 || true)
+                [[ -z "$a_lns" ]] && continue
+                for aln in $a_lns; do
+                    local s=$((aln + 1)) e=$((aln + 3))
+                    if sed -n "${s},${e}p" "$fpath" 2>/dev/null | grep -qF -- "$line_b"; then
+                        ((swap_fixed++)) || true
+                        break
+                    fi
+                done
+            done < <(awk -v fname="$tfile" '
+                /^diff --git/ { in_file = index($0, fname) > 0; prev = ""; prev_type = "" }
+                in_file && substr($0,1,1) == "-" && substr($0,1,3) != "---" { next }
+                in_file && substr($0,1,1) == " " {
+                    line = $0; gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
+                    if (length(line) >= 8 && line != "{" && line != "}" && substr(line,1,2) != "/*" && substr(line,1,1) != "*") {
+                        if (prev_type == "add") printf "%s\t%s\n", prev, line
+                        prev = line; prev_type = "ctx"
+                    }
+                }
+                in_file && substr($0,1,1) == "+" && substr($0,1,3) != "+++" {
+                    line = substr($0, 2); gsub(/^[[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
+                    if (length(line) >= 8 && line != "{" && line != "}") {
+                        if (prev_type == "ctx") printf "%s\t%s\n", prev, line
+                        prev = line; prev_type = "add"
+                    }
+                }
+            ' "$diff_file")
+
+            unset swap_moved_set
+        done < "$files_file"
+
+        if [[ "$swap_unfixed" -gt 0 ]]; then
+            echo "UNFIXED"
+            return
+        elif [[ "$swap_fixed" -gt 0 ]]; then
+            echo "LIKELY_FIXED"
+            return
+        fi
+    fi
+
     # ---- Phase 1: Fingerprint-based verdict ----
     local verdict="INCONCLUSIVE"
 
     if [[ "$total_removed" -gt 0 && "$removed_ratio" -ge 70 && "$removed_contiguous" -eq 1 ]]; then
         if [[ "$total_added" -gt 0 && "$added_ratio" -ge 80 ]]; then
-            # Both fix code AND vulnerable code pattern present. This
-            # happens when the same code pattern exists in multiple
-            # functions and the fix only changes some occurrences.
-            verdict="LIKELY_FIXED"
+            if [[ "$total_moved" -gt 0 && "$total_moved" -ge "$total_added" ]]; then
+                # All added lines are "moved" (identical in both + and -).
+                # The high added_ratio comes from matching the ORIGINAL
+                # (pre-fix) location, not from the fix being applied.
+                # Code-relocation fix: vulnerable code still at original location.
+                verdict="UNFIXED"
+            elif [[ "$total_added" -le 2 ]]; then
+                # Very small fix (1-2 distinctive lines). Finding them in
+                # the source is expected by chance in files with repetitive
+                # patterns. High removed_ratio confirms vulnerability present.
+                verdict="UNFIXED"
+            elif [[ "$total_removed" -le 1 ]]; then
+                # Single removed-line match too weak to corroborate
+                verdict="UNFIXED"
+            else
+                # Both fix code AND vulnerable code present - genuinely inconclusive
+                verdict="INCONCLUSIVE"
+            fi
         else
             verdict="UNFIXED"
         fi
@@ -1559,24 +1896,38 @@ check_fix_applied_w() {
         if [[ "$total_removed" -ge 2 && "$total_added" -ge 3 && "$removed_ratio" -lt 15 && "$added_ratio" -ge 70 ]]; then
             verdict="FIXED"
         elif [[ "$total_removed" -gt 0 && "$removed_ratio" -lt 50 ]]; then
-            verdict="LIKELY_FIXED"
+            # Ambiguous - validated: unreliable for LIKELY_FIXED
+            verdict="INCONCLUSIVE"
         elif [[ "$total_removed" -eq 0 ]]; then
             # Pure addition: no removed-line evidence -> INCONCLUSIVE
             verdict="INCONCLUSIVE"
         elif [[ "$removed_ratio" -ge 70 ]]; then
-            if [[ "$added_ratio" -ge 80 ]]; then
-                verdict="LIKELY_FIXED"
+            if [[ "$total_moved" -gt 0 && "$total_moved" -ge "$total_added" ]]; then
+                # Code-relocation: added lines match original location only
+                verdict="UNFIXED"
+            elif [[ "$total_added" -le 2 ]]; then
+                # Very small fix with high removed ratio - added matches
+                # are likely coincidental from other call sites
+                verdict="UNFIXED"
+            elif [[ "$total_removed" -le 1 ]]; then
+                # Single removed-line match too weak to corroborate
+                verdict="UNFIXED"
+            elif [[ "$added_ratio" -ge 80 ]]; then
+                # Both present - genuinely inconclusive without location awareness
+                verdict="INCONCLUSIVE"
             else
                 verdict="UNFIXED"
             fi
         else
-            verdict="LIKELY_FIXED"
+            # Remaining cases (50%<=removed<70%): ambiguous
+            verdict="INCONCLUSIVE"
         fi
     elif [[ "$total_added" -gt 0 && "$added_ratio" -ge 40 ]]; then
         if [[ "$total_removed" -gt 0 && "$removed_ratio" -ge 50 ]]; then
             verdict="UNFIXED"
         elif [[ "$total_removed" -gt 0 ]]; then
-            verdict="LIKELY_FIXED"
+            # Weak match - validated: unreliable for LIKELY_FIXED
+            verdict="INCONCLUSIVE"
         else
             verdict="INCONCLUSIVE"
         fi
@@ -1617,6 +1968,20 @@ check_fix_applied_w() {
             # Check context+ADDED pairs (context_before AND context_after)
             while IFS=$'\t' read -r ctx_line add_line; do
                 [[ -z "$ctx_line" || -z "$add_line" ]] && continue
+                # Skip boilerplate added lines that produce false context matches
+                [[ ${#add_line} -lt 8 ]] && continue
+                [[ "$add_line" == "break;" || "$add_line" == "continue;" ]] && continue
+                [[ "$add_line" == return* ]] && continue
+                [[ "$add_line" == goto\ * ]] && continue
+                [[ "$add_line" == else || "$add_line" == "default:" ]] && continue
+                [[ "$add_line" == "NULL" ]] && continue
+                # Skip simple variable declarations (match fingerprint filter)
+                [[ "$add_line" =~ ^(int|long|bool|void|unsigned|struct|enum|const|static)\ [a-z_]+\;$ ]] && continue
+                [[ "$add_line" =~ ^(int|long)\ (ret|err|rc|res|status)\;$ ]] && continue
+                [[ "$add_line" =~ ^(int|long)\ (ret|err|rc|res|status)\ =\ 0\;$ ]] && continue
+                # Skip simple error checks
+                [[ "$add_line" =~ ^if\ \((err|ret|rc)\)$ ]] && continue
+                [[ "$add_line" =~ ^if\ \((err|ret|rc|res)\ \<\ 0\)$ ]] && continue
                 ((ctx_found++)) || true
                 local ctx_lns
                 ctx_lns=$(grep -nF -- "$ctx_line" "$fpath" 2>/dev/null | cut -d: -f1 || true)
@@ -1688,11 +2053,10 @@ check_fix_applied_w() {
 
         if [[ "$ctx_found" -gt 0 ]]; then
             if [[ "$ctx_fixed" -gt "$ctx_unfixed" ]]; then
-                if [[ "$verdict" == "INCONCLUSIVE" ]]; then
-                    verdict="LIKELY_FIXED"
-                fi
-                # LIKELY_FIXED stays LIKELY_FIXED - context adjacency alone
-                # is not reliable enough to upgrade to FIXED.
+                # Context majority says fix applied.
+                # Do NOT upgrade INCONCLUSIVE - context adjacency is unreliable
+                # for this (validated: 100% false positive rate).
+                :
             elif [[ "$ctx_unfixed" -gt "$ctx_fixed" ]]; then
                 if [[ "$verdict" == "LIKELY_FIXED" ]]; then
                     if [[ "$ctx_unfixed" -ge $(( ctx_fixed * 2 + 1 )) && "$total_added" -le 2 ]]; then verdict="UNFIXED"; fi
@@ -1787,16 +2151,21 @@ while IFS=$'\t' read -r cve_id cvss_score severity description; do
         # FIXED requires: at least one FIXED verdict AND zero UNFIXED
         # verdicts AND FIXED must dominate. Any UNFIXED vote vetoes FIXED
         # because different branch backports may produce inconsistent results.
+        # UNFIXED dominates LIKELY_FIXED: NVD fix refs often include backport
+        # hashes for older kernel branches whose code context differs from
+        # the target kernel. These mismatched hashes produce unreliable
+        # verdicts (often false LIKELY_FIXED). If any hash confidently says
+        # UNFIXED, the conservative (security-safe) approach is UNFIXED.
         if [[ "$fixed_count" -gt 0 && "$unfixed_count" -eq 0 && "$fixed_count" -gt "$likely_count" ]]; then
             fix_status="FIXED"
         elif [[ "$fixed_count" -gt 0 && "$unfixed_count" -gt 0 ]]; then
             # Mixed signals: some hashes say FIXED, others UNFIXED.
             # Conservatively report LIKELY_FIXED.
             fix_status="LIKELY_FIXED"
-        elif [[ "$likely_count" -gt 0 ]]; then
-            fix_status="LIKELY_FIXED"
         elif [[ "$unfixed_count" -gt 0 ]]; then
             fix_status="UNFIXED"
+        elif [[ "$likely_count" -gt 0 ]]; then
+            fix_status="LIKELY_FIXED"
         elif [[ "$inconc_count" -gt 0 ]]; then
             fix_status="INCONCLUSIVE"
         fi
